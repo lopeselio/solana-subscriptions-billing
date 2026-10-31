@@ -44,6 +44,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { SolanaChain } from '../../src/chain/solana.js';
 import { connectPglite, type Db, migrate } from '../../src/db/db.js';
 import { Repo } from '../../src/db/repo.js';
+import { refreshEntitlements } from '../../src/indexer/entitlements.js';
 import { syncOnce } from '../../src/indexer/sync.js';
 import { deliverDueEvents } from '../../src/webhooks/dispatcher.js';
 import { generateSecret } from '../../src/webhooks/signature.js';
@@ -60,6 +61,7 @@ const WS_URL = (() => {
 const USDC = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 const PRICE = 1_000_000n; // 1 USDC per period
 const PERIOD_HOURS = 1n;
+const GRACE_SECS = 1800n;
 const log = pino({ level: process.env.LOG_LEVEL ?? 'silent' });
 const cfg: WorkerConfig = { retryScheduleSecs: [60], pendingTimeoutSecs: 180, maxChargesPerCycle: 50, dryRun: false };
 
@@ -151,10 +153,16 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         return sub;
     }
 
+    // Same order as the service loop: sync, entitlement pass (cluster time), charge.
     const cycle = async () => {
         await syncOnce({ repo, chain, scope: 'managed', log });
+        await refreshEntitlements({ repo, now: await chain.clusterTime(), graceSecs: GRACE_SECS, log });
         return runChargeCycle({ repo, chain, cfg, log });
     };
+    const statuses = async (sub: Address) =>
+        (await repo.listEvents({ type: 'entitlement.changed' }))
+            .filter(e => e.data.subscription === sub)
+            .map(e => e.data.status);
 
     let aliceSub: Address;
     let bobSub: Address;
@@ -269,6 +277,13 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         expect(await usdcBalance(merchant.address)).toBe(2n * PRICE);
     }, 120_000);
 
+    it('announces entitlement changes at cluster time', async () => {
+        // alice: unpaid -> paid -> period 2 due -> access ended by her cancellation
+        expect(await statuses(aliceSub)).toEqual(['grace', 'active', 'grace', 'cancelled']);
+        // bob never paid; grace ran out after the first time travel
+        expect(await statuses(bobSub)).toEqual(['grace', 'past_due']);
+    });
+
     it('delivers every recorded event as a verifiable webhook', async () => {
         const secret = generateSecret();
         const received: unknown[] = [];
@@ -295,6 +310,7 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
                     'subscription.cancelled',
                     'payment.succeeded',
                     'payment.failed',
+                    'entitlement.changed',
                 ]),
             );
             expect(got.filter(e => e.type === 'payment.succeeded')).toHaveLength(2);
