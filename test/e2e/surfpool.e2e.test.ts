@@ -36,6 +36,7 @@ import {
     getCreatePlanOverlayInstructionAsync,
     getInitSubscriptionAuthorityOverlayInstructionAsync,
     getSubscribeOverlayInstructionAsync,
+    getTransferSubscriptionOverlayInstructionAsync,
 } from '@solana/subscriptions';
 import pino from 'pino';
 import { Webhook } from 'standardwebhooks';
@@ -45,6 +46,7 @@ import { SolanaChain } from '../../src/chain/solana.js';
 import { connectPglite, type Db, migrate } from '../../src/db/db.js';
 import { Repo } from '../../src/db/repo.js';
 import { refreshEntitlements } from '../../src/indexer/entitlements.js';
+import { ingestEvents } from '../../src/indexer/ingest.js';
 import { syncOnce } from '../../src/indexer/sync.js';
 import { deliverDueEvents } from '../../src/webhooks/dispatcher.js';
 import { generateSecret } from '../../src/webhooks/signature.js';
@@ -153,9 +155,11 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         return sub;
     }
 
-    // Same order as the service loop: sync, entitlement pass (cluster time), charge.
+    // Same order as the service loop: sync, event ingestion, entitlement pass (cluster time), charge.
+    const ingest = () => ingestEvents({ repo, chain, scope: 'managed', log });
     const cycle = async () => {
         await syncOnce({ repo, chain, scope: 'managed', log });
+        await ingest();
         await refreshEntitlements({ repo, now: await chain.clusterTime(), graceSecs: GRACE_SECS, log });
         return runChargeCycle({ repo, chain, cfg, log });
     };
@@ -207,7 +211,7 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         db = await connectPglite();
         await migrate(db);
         repo = new Repo(db);
-        chain = new SolanaChain({ rpcUrl: RPC_URL, wsUrl: WS_URL, signer: puller });
+        chain = new SolanaChain({ rpcUrl: RPC_URL, wsUrl: WS_URL, signer: puller, ingestCommitment: 'confirmed' });
     }, 120_000);
 
     afterAll(async () => {
@@ -263,6 +267,55 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         expect(await usdcBalance(merchant.address)).toBe(2n * PRICE);
     }, 120_000);
 
+    it('ingests the deployed program\'s events: the worker\'s transfers, without double-announcing them', async () => {
+        await ingest();
+        const transfers = await repo.listChainEvents({ kind: 'subscription_transfer', subscription: aliceSub });
+        const attempts = await repo.listAttempts({ subscription: aliceSub, status: 'succeeded' });
+        expect(transfers.map(t => t.signature).sort()).toEqual(attempts.map(a => a.signature).sort());
+        const [merchantAta] = await findAssociatedTokenPda({ owner: merchant.address, mint: USDC, tokenProgram: TOKEN_PROGRAM_ADDRESS });
+        expect(transfers[0]!.data).toMatchObject({
+            plan: planPda,
+            delegator: alice.address,
+            mint: USDC,
+            amount: PRICE.toString(),
+            amountPulledInPeriod: PRICE.toString(),
+            receiver: merchant.address,
+            receiverTokenAccount: merchantAta,
+            puller: puller.address,
+        });
+        const created = await repo.listChainEvents({ kind: 'subscription_created' });
+        expect(created.map(c => c.subscription).sort()).toEqual([aliceSub, bobSub].sort());
+        expect((await repo.listEvents({ type: 'payment.succeeded' })).every(e => e.data.source === 'worker')).toBe(true);
+    }, 60_000);
+
+    it('announces a pull made outside the worker (the merchant pulling directly)', async () => {
+        const [merchantAta] = await findAssociatedTokenPda({ owner: merchant.address, mint: USDC, tokenProgram: TOKEN_PROGRAM_ADDRESS });
+        await send(merchant, [
+            await getTransferSubscriptionOverlayInstructionAsync({
+                amount: 50_000n,
+                caller: merchant,
+                delegator: bob.address,
+                planPda,
+                receiverAta: merchantAta,
+                subscriptionPda: bobSub,
+                tokenMint: USDC,
+                tokenProgram: TOKEN_PROGRAM_ADDRESS,
+                transferHookAccounts: [],
+            }),
+        ]);
+        await ingest();
+        const external = (await repo.listEvents({ type: 'payment.succeeded' })).filter(e => e.data.source === 'chain');
+        expect(external).toHaveLength(1);
+        expect(external[0]!.data).toMatchObject({
+            subscription: bobSub,
+            subscriber: bob.address,
+            puller: merchant.address,
+            amount: '50000',
+            amountPulledInPeriod: '50000',
+        });
+        expect(await usdcBalance(bob.address)).toBe(50_000n);
+    }, 60_000);
+
     it('stops after the subscriber cancels and the period ends', async () => {
         await send(alice, [await getCancelSubscriptionOverlayInstructionAsync({ subscriber: alice, planPda })]);
         await syncOnce({ repo, chain, scope: 'managed', log });
@@ -270,11 +323,15 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
 
         const [cancelled] = await repo.listEvents({ type: 'subscription.cancelled' });
         expect(cancelled?.data).toMatchObject({ subscription: aliceSub });
+        await ingest();
+        const [onChain] = await repo.listChainEvents({ kind: 'subscription_cancelled' });
+        expect(onChain).toMatchObject({ subscription: aliceSub, subscriber: alice.address });
+        expect(onChain!.data.expiresAtTs).toBe((await repo.getSubscription(aliceSub))!.expiresAtTs.toString());
 
         await timeTravelSecs(PERIOD_HOURS * 3600n + 60n);
         const res = await cycle();
         expect(res.charged).toBe(0);
-        expect(await usdcBalance(merchant.address)).toBe(2n * PRICE);
+        expect(await usdcBalance(merchant.address)).toBe(2n * PRICE + 50_000n); // + the merchant's own pull from bob
     }, 120_000);
 
     it('announces entitlement changes at cluster time', async () => {
@@ -313,7 +370,7 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
                     'entitlement.changed',
                 ]),
             );
-            expect(got.filter(e => e.type === 'payment.succeeded')).toHaveLength(2);
+            expect(got.filter(e => e.type === 'payment.succeeded')).toHaveLength(3); // 2 by the worker, 1 by the merchant
         } finally {
             await new Promise(r => server.close(r));
         }
