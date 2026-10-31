@@ -51,6 +51,16 @@ reconciled on the next cycle from the signature status instead of being re-sent 
 allows at most one pending-or-succeeded attempt per subscription period, so concurrent workers or restarts
 cannot double-charge (and the program caps each period on-chain regardless).
 
+Charges for the same plan go out together, up to `CHARGE_BATCH_SIZE` (default 4) per transaction.
+Each transfer adds 182 bytes and 3 unique accounts, so 4 is the most that fits in Solana's
+1232-byte limit (address lookup tables don't help: the unique accounts differ per subscriber). That
+is one signature fee instead of four. A transaction is all or nothing, so when a batch fails the
+worker fails only the charge the error points to and sends the others one per transaction; a batch
+that can't be sent at all (too large, transfer-hook mints) also falls back to single transactions.
+
+If a transaction was sent but its confirmation failed (e.g. timed out), the attempt stays pending
+and is settled from the signature status rather than marked failed, since it may have landed.
+
 Before sending, the worker checks the subscriber's token account off-chain and records a failed attempt
 without paying a fee if the account is missing, the Subscription Authority is no longer its delegate, or
 the balance is short.
@@ -189,14 +199,14 @@ v0.1. Tested three ways:
   preflight without sending, charges again only in the next period, stops after cancellation, and
   announces entitlement changes (an unpaid subscriber going `past_due`, access ending after
   cancellation), decodes the deployed program's events, announces a pull the merchant made
-  directly, and delivers every resulting event as a webhook that the reference
+  directly, sends 5 charges as a 4-transfer and a 1-transfer transaction, and delivers every resulting event as a webhook that the reference
   `standardwebhooks` library verifies.
 
 - [x] End-to-end test against Surfpool
 - [x] Signed webhooks (`payment.succeeded`, `payment.failed`, `subscription.cancelled`, ...)
 - [x] `entitlement.changed` events, including time-based changes (`past_due`, access ending)
 - [x] Event ingestion (self-CPI events) for a full payment ledger, including pulls by other pullers
-- [ ] Batching several charges per transaction
+- [x] Batching several charges per transaction
 - [ ] Plan metadata JSON schema for `metadataUri`
 
 ## Development
