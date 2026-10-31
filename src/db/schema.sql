@@ -85,3 +85,6 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_due_idx ON events (next_delivery_at) WHERE delivery_status = 'pending';
 CREATE INDEX IF NOT EXISTS events_type_idx ON events (type, id);
+
+-- Last entitlement status announced via `entitlement.changed` (NULL = never evaluated).
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS entitlement_status TEXT;

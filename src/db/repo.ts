@@ -54,7 +54,8 @@ export type EventType =
     | 'subscription.cancelled'
     | 'subscription.closed'
     | 'payment.succeeded'
-    | 'payment.failed';
+    | 'payment.failed'
+    | 'entitlement.changed';
 
 export type DeliveryStatus = 'pending' | 'delivered' | 'failed';
 
@@ -297,6 +298,49 @@ export class Repo {
     async getSubscription(address: string): Promise<SubscriptionRecord | null> {
         const res = await this.db.query(`SELECT * FROM subscriptions WHERE address = $1`, [address]);
         return res.rows[0] ? toSubscription(res.rows[0]) : null;
+    }
+
+    /** Subscriptions whose entitlement may need re-evaluating: open ones, and closed ones not yet announced. */
+    async listForEntitlement(): Promise<
+        { sub: SubscriptionRecord; planEndTs: bigint; entitlementStatus: string | null }[]
+    > {
+        const res = await this.db.query(
+            `SELECT s.*, COALESCE(p.end_ts, 0) AS plan_end_ts FROM subscriptions s
+             LEFT JOIN plans p ON p.address = s.plan
+             WHERE NOT s.closed OR s.entitlement_status IS DISTINCT FROM 'closed'
+             ORDER BY s.first_seen_at`,
+        );
+        return res.rows.map(r => ({
+            sub: toSubscription(r),
+            planEndTs: big(r.plan_end_ts),
+            entitlementStatus: (r.entitlement_status as string | null) ?? null,
+        }));
+    }
+
+    /**
+     * Compare-and-set the stored entitlement status from `from` to `to.status`, emitting
+     * `entitlement.changed` in the same statement. Returns false (and emits nothing) if another
+     * process already moved it.
+     */
+    async setEntitlement(
+        address: string,
+        from: string | null,
+        to: { status: string; entitled: boolean; accessUntilTs: bigint | null },
+    ): Promise<boolean> {
+        const res = await this.db.query(
+            `WITH u AS (
+                UPDATE subscriptions SET entitlement_status = $3
+                WHERE address = $1 AND entitlement_status IS NOT DISTINCT FROM $2::text
+                RETURNING *)
+             INSERT INTO events (type, data)
+             SELECT 'entitlement.changed', ${subscriptionJson('u')} || jsonb_build_object(
+                    'previousStatus', $2::text, 'status', $3::text, 'entitled', $4::boolean,
+                    'accessUntilTs', $5::text)
+             FROM u
+             RETURNING id`,
+            [address, from, to.status, to.entitled, to.accessUntilTs?.toString() ?? null],
+        );
+        return res.rows.length > 0;
     }
 
     // ---- charge attempts ----
