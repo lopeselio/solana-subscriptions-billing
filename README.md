@@ -9,7 +9,7 @@ enforcement." This service is that missing off-chain layer:
 
 | Component      | What it does                                                                                     |
 | -------------- | ------------------------------------------------------------------------------------------------ |
-| **Indexer**    | Snapshots plans and subscriptions from chain into Postgres.                                      |
+| **Indexer**    | Snapshots plans and subscriptions, and reads the program's events into a payment ledger.        |
 | **Worker**     | Charges each due period via `transferSubscription` as the plan owner or a whitelisted puller.    |
 | **Retries**    | Preflights balance/delegate off-chain, classifies failures, retries on a configurable schedule. |
 | **API**        | Subscription state, charge history, and a `GET /entitlements/:wallet` access check.            |
@@ -78,7 +78,8 @@ the balance is short.
 | `cancelled`, `plan_ended`, `not_started` | no |                                              |
 
 Other endpoints: `GET /plans`, `GET /plans/:address`, `GET /subscriptions/:address`,
-`GET /charges?status=failed`, `GET /events` (see [Webhooks](#webhooks)). Set `API_KEY` to require `Authorization: Bearer <key>`; otherwise
+`GET /charges?status=failed`, `GET /payments` (see [Payment ledger](#payment-ledger)),
+`GET /events` (see [Webhooks](#webhooks)). Set `API_KEY` to require `Authorization: Bearer <key>`; otherwise
 keep the API bound to localhost.
 
 ## Webhooks
@@ -97,7 +98,7 @@ pnpm billing webhook-secret     # prints whsec_...; put it in WEBHOOK_SECRET
 | `subscription.cancelled` | cancelled, or the end moved earlier (`CancelSubscriptionNow`); `data.expiresAtTs` is when access ends |
 | `subscription.resumed`   | the subscriber undid a pending cancellation (`ResumeSubscription`)       |
 | `subscription.closed`    | the subscription account no longer exists on-chain                       |
-| `payment.succeeded`      | this worker's charge landed; `data.signature` is the transaction         |
+| `payment.succeeded`      | a charge landed: this worker's (`data.source: "worker"`) or any other puller's (`"chain"`, see [Payment ledger](#payment-ledger)) |
 | `payment.failed`         | a charge attempt failed; `data.reason`, `data.nextRetryAt`, `data.final` |
 | `entitlement.changed`    | access status changed; `data.previousStatus`, `data.status`, `data.entitled`, `data.accessUntilTs` |
 
@@ -136,8 +137,34 @@ const event = new Webhook(process.env.WEBHOOK_SECRET).verify(rawBody, headers); 
   so receivers keep verifying while they switch to the new one.
 - **Polling instead.** The same events are at `GET /events?after=<id>&type=&limit=`; events are
   recorded whether or not `WEBHOOK_URL` is set (and delivered from the start once it is).
-- `payment.*` covers charges made by this worker. Pulls by other pullers show up as changes in
-  the subscription snapshot; a full on-chain ledger needs event ingestion (see roadmap).
+- `payment.failed` covers this worker's attempts; failed transactions by other pullers aren't
+  reported.
+
+## Payment ledger
+
+The program emits an event for every subscription transfer (and for subscribe, cancel, resume and
+plan updates) as a self-CPI signed by its `event_authority` PDA. The indexer reads these from
+transaction history into the `chain_events` table, so the ledger includes pulls by the merchant
+or any other whitelisted puller, not only this worker's. It accepts only inner instructions to the
+program signed by that PDA, which nothing else can produce.
+
+- **What is scanned.** Each tracked plan's transaction history, or the whole program's with
+  `PLAN_SCOPE=all`.
+- **Live.** Tracking starts at a source's newest transaction when it is first seen. Each sync then
+  reads newer transactions oldest first and announces pulls this worker didn't make as
+  `payment.succeeded` with `source: "chain"` (with `puller`, `receiver`, `amountPulledInPeriod`).
+  The worker's own charges are matched by signature and not announced twice.
+- **Backfill.** With the budget left over (`INGEST_MAX_TX_PER_PASS`), older history is loaded
+  backwards, a page per pass, into the ledger without being announced. `INGEST_BACKFILL=false`
+  skips it. Events from program v0.3.0 (mainnet before 2026-07-13) decode with the fields that
+  version lacked (`puller`, `receiverTokenAccount`, `payer`) as null.
+- **Finality.** `INGEST_COMMITMENT=finalized` (default) only records transactions that can't be
+  rolled back, about 13 seconds after confirmation.
+- **Cost.** One `getTransaction` per transaction touching a tracked plan. With `PLAN_SCOPE=all`,
+  that's every program transaction; on a public RPC expect roughly 2 per second.
+
+`GET /payments?plan=&subscription=&subscriber=&limit=` returns the ledger newest first, and
+`GET /subscriptions/:address` includes it as `payments`.
 
 ## Security notes
 
@@ -154,18 +181,21 @@ const event = new Webhook(process.env.WEBHOOK_SECRET).verify(rawBody, headers); 
 v0.1. Tested three ways:
 
 - unit and engine tests against an in-memory chain and embedded Postgres;
-- read-only sync of real devnet data (~1k plans, ~900 subscriptions);
+- read-only sync of real devnet data (~1k plans, ~900 subscriptions), including event ingestion:
+  every decoded transfer matched its subscription, plan, mint, period limit and an authorized
+  puller in the account snapshot;
 - end-to-end on Surfpool (mainnet fork, the deployed program, real USDC): the worker charges as a
   whitelisted puller, creates the merchant's token account, blocks an underfunded subscriber in
   preflight without sending, charges again only in the next period, stops after cancellation, and
   announces entitlement changes (an unpaid subscriber going `past_due`, access ending after
-  cancellation), and delivers every resulting event as a webhook that the reference
+  cancellation), decodes the deployed program's events, announces a pull the merchant made
+  directly, and delivers every resulting event as a webhook that the reference
   `standardwebhooks` library verifies.
 
 - [x] End-to-end test against Surfpool
 - [x] Signed webhooks (`payment.succeeded`, `payment.failed`, `subscription.cancelled`, ...)
 - [x] `entitlement.changed` events, including time-based changes (`past_due`, access ending)
-- [ ] Event ingestion (self-CPI events) for a full payment ledger, including pulls by other pullers
+- [x] Event ingestion (self-CPI events) for a full payment ledger, including pulls by other pullers
 - [ ] Batching several charges per transaction
 - [ ] Plan metadata JSON schema for `metadataUri`
 
