@@ -23,12 +23,15 @@ import {
     setTransactionMessageLifetimeUsingBlockhash,
     signTransactionMessageWithSigners,
     SOLANA_ERROR__INSTRUCTION_ERROR__CUSTOM,
+    signature as toSignature,
 } from '@solana/kit';
 import {
     DELEGATEE_OFFSET,
     decodePlan,
     decodeSubscriptionDelegation,
+    findEventAuthorityPda,
     findSubscriptionAuthorityPda,
+    findSubscriptionDelegationPda,
     getTransferSubscriptionOverlayInstructionAsync,
     PLAN_SIZE,
     resolveTransferHookAccounts,
@@ -46,12 +49,14 @@ import {
 } from '@solana/subscriptions';
 
 import type { FailureReason } from '../core/billing.js';
+import { extractEvents, type JsonTransaction, type ProgramEvent } from './events.js';
 import {
     type Chain,
     ChargeError,
     type ChainPlan,
     type ChainSubscription,
     type ChargeRequest,
+    type SignatureInfo,
     type SignatureOutcome,
     type SourceAccountState,
 } from './types.js';
@@ -67,6 +72,8 @@ export interface SolanaChainOptions {
     signer?: KeyPairSigner;
     /** Priority fee in micro-lamports per compute unit. 0 = none. */
     computeUnitPriceMicroLamports?: bigint;
+    /** Commitment for event ingestion. 'finalized' (default) never sees a rolled-back fork. */
+    ingestCommitment?: 'confirmed' | 'finalized';
 }
 
 export async function loadKeypairFile(path: string): Promise<KeyPairSigner> {
@@ -89,7 +96,8 @@ type ParsedTokenAccount = {
 export class SolanaChain implements Chain {
     private readonly rpc;
     private readonly sendAndConfirm;
-    private readonly programAddress: Address;
+    readonly programAddress: Address;
+    private eventAuthority: Promise<Address> | null = null;
     private readonly tokenProgramCache = new Map<string, Address>();
 
     constructor(private readonly opts: SolanaChainOptions) {
@@ -107,6 +115,51 @@ export class SolanaChain implements Chain {
         const slot = await this.rpc.getSlot({ commitment: 'confirmed' }).send();
         const t = await this.rpc.getBlockTime(slot).send();
         return t === null ? BigInt(Math.floor(Date.now() / 1000)) : BigInt(t);
+    }
+
+    async signaturePage(
+        addr: string,
+        opts: { before?: string; until?: string; limit: number },
+    ): Promise<SignatureInfo[]> {
+        const page = await withRetry(() =>
+            this.rpc
+                .getSignaturesForAddress(address(addr), {
+                    commitment: this.opts.ingestCommitment ?? 'finalized',
+                    limit: opts.limit,
+                    before: opts.before ? toSignature(opts.before) : undefined,
+                    until: opts.until ? toSignature(opts.until) : undefined,
+                })
+                .send(),
+        );
+        return page.map(s => ({
+            signature: s.signature,
+            slot: BigInt(s.slot),
+            blockTime: s.blockTime === null ? null : BigInt(s.blockTime),
+            failed: s.err !== null,
+        }));
+    }
+
+    async subscriptionAddress(plan: string, subscriber: string): Promise<string> {
+        const [pda] = await findSubscriptionDelegationPda(
+            { planPda: address(plan), subscriber: address(subscriber) },
+            { programAddress: this.programAddress },
+        );
+        return pda;
+    }
+
+    async transactionEvents(sig: string): Promise<ProgramEvent[] | null> {
+        this.eventAuthority ??= findEventAuthorityPda({ programAddress: this.programAddress }).then(([pda]) => pda);
+        const tx = await withRetry(() =>
+            this.rpc
+                .getTransaction(toSignature(sig), {
+                    commitment: this.opts.ingestCommitment ?? 'finalized',
+                    encoding: 'json',
+                    maxSupportedTransactionVersion: 0,
+                })
+                .send(),
+        );
+        if (!tx) return null;
+        return extractEvents(tx as unknown as JsonTransaction, this.programAddress, await this.eventAuthority);
     }
 
     async fetchAllPlans(): Promise<ChainPlan[]> {

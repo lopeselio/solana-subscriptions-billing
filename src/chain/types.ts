@@ -1,5 +1,6 @@
 import type { FailureReason } from '../core/billing.js';
 import type { PlanRecord, SubscriptionRecord } from '../db/repo.js';
+import type { ProgramEvent } from './events.js';
 
 export type ChainPlan = Omit<PlanRecord, 'closed'>;
 export type ChainSubscription = Omit<SubscriptionRecord, 'closed'>;
@@ -20,6 +21,14 @@ export interface ChargeRequest {
 }
 
 export type SignatureOutcome = { status: 'succeeded' } | { status: 'failed'; error: string } | { status: 'unknown' };
+
+export interface SignatureInfo {
+    signature: string;
+    slot: bigint;
+    blockTime: bigint | null;
+    /** The transaction failed; it carries no events. */
+    failed: boolean;
+}
 
 /** A charge failed on-chain or in preflight. */
 export class ChargeError extends Error {
@@ -52,4 +61,16 @@ export interface Chain {
      */
     charge(req: ChargeRequest, onSigned: (signature: string) => Promise<void>): Promise<string>;
     signatureOutcome(signature: string): Promise<SignatureOutcome>;
+
+    /** The subscriptions program address (the history source for program-wide ingestion). */
+    readonly programAddress: string;
+    /**
+     * One page of signatures of transactions touching `address`, newest first, strictly between
+     * `until` and `before` when given (getSignaturesForAddress semantics).
+     */
+    signaturePage(address: string, opts: { before?: string; until?: string; limit: number }): Promise<SignatureInfo[]>;
+    /** The SubscriptionDelegation PDA for (plan, subscriber). */
+    subscriptionAddress(plan: string, subscriber: string): Promise<string>;
+    /** The program's events in a transaction, in order; null if the transaction isn't available yet. */
+    transactionEvents(signature: string): Promise<ProgramEvent[] | null>;
 }

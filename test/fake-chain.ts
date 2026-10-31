@@ -1,8 +1,12 @@
+import type { Address } from '@solana/kit';
+
+import type { ProgramEvent } from '../src/chain/events.js';
 import type {
     Chain,
     ChainPlan,
     ChainSubscription,
     ChargeRequest,
+    SignatureInfo,
     SignatureOutcome,
     SourceAccountState,
 } from '../src/chain/types.js';
@@ -19,9 +23,93 @@ export class FakeChain implements Chain {
     signatures = new Map<string, SignatureOutcome>();
     /** Next charge throws this, once. */
     failNext: ChargeError | null = null;
+    /** Transaction history, oldest first, as getSignaturesForAddress would see it. */
+    txs: (SignatureInfo & { addresses: string[]; events: ProgramEvent[] })[] = [];
+    /** Signatures whose transaction getTransaction can't return yet. */
+    unavailable = new Set<string>();
+    readonly programAddress = 'Program1111111111111111111111111111111111111';
     private sigCounter = 0;
 
     constructor(readonly signerAddress: string | null) {}
+
+    /** Appends a transaction touching the program, `addresses` and the plans/subscriptions in `events`. */
+    record(events: ProgramEvent[], opts: { failed?: boolean; addresses?: string[] } = {}): string {
+        const signature = `sig${++this.sigCounter}`;
+        const touched = events.flatMap(e => ('subscription' in e ? [e.plan, e.subscription] : [e.plan]));
+        this.txs.push({
+            signature,
+            slot: BigInt(this.txs.length + 1),
+            blockTime: this.now,
+            failed: opts.failed ?? false,
+            addresses: [this.programAddress, ...touched, ...(opts.addresses ?? [])],
+            events: opts.failed ? [] : events,
+        });
+        return signature;
+    }
+
+    /** A pull by someone other than the worker (e.g. the merchant or another puller). */
+    externalPull(subscription: string, amount: bigint, puller: string): string {
+        const transfer = this.applyPull(subscription, amount, puller);
+        return this.record([transfer]);
+    }
+
+    private applyPull(subscription: string, amount: bigint, puller: string): ProgramEvent {
+        const s = this.subs.get(subscription)!;
+        const plan = this.plans.get(s.plan)!;
+        const { periodStartTs, pulled } = effectivePeriod(
+            {
+                amountPerPeriod: s.amount,
+                periodHours: s.periodHours,
+                currentPeriodStartTs: s.currentPeriodStartTs,
+                amountPulledInPeriod: s.amountPulledInPeriod,
+                expiresAtTs: s.expiresAtTs,
+            },
+            plan.endTs,
+            this.now,
+        );
+        if (pulled + amount > s.amount) throw new ChargeError('program_error', 'program error 400');
+        this.subs.set(s.address, { ...s, currentPeriodStartTs: periodStartTs, amountPulledInPeriod: pulled + amount });
+        const receiver = (plan.destinations[0] ?? plan.owner) as Address;
+        return {
+            kind: 'subscription_transfer',
+            subscription: s.address as Address,
+            plan: s.plan as Address,
+            delegator: s.subscriber as Address,
+            mint: plan.mint as Address,
+            amount,
+            periodStartTs,
+            periodEndTs: periodStartTs + s.periodHours * 3600n,
+            amountPulledInPeriod: pulled + amount,
+            receiver,
+            receiverTokenAccount: `ATA:${receiver}` as Address,
+            puller: puller as Address,
+        };
+    }
+
+    async signaturePage(
+        address: string,
+        opts: { before?: string; until?: string; limit: number },
+    ): Promise<SignatureInfo[]> {
+        const touching = this.txs.filter(t => t.addresses.includes(address));
+        const pos = (sig?: string) => (sig === undefined ? -1 : touching.findIndex(t => t.signature === sig));
+        const lo = opts.until === undefined ? 0 : pos(opts.until) + 1;
+        const hi = opts.before === undefined ? touching.length : pos(opts.before);
+        return touching
+            .slice(lo, hi)
+            .reverse()
+            .slice(0, opts.limit)
+            .map(({ signature, slot, blockTime, failed }) => ({ signature, slot, blockTime, failed }));
+    }
+
+    async subscriptionAddress(plan: string, subscriber: string): Promise<string> {
+        const s = [...this.subs.values()].find(x => x.plan === plan && x.subscriber === subscriber);
+        return s?.address ?? `Sub:${plan}:${subscriber}`;
+    }
+
+    async transactionEvents(signature: string): Promise<ProgramEvent[] | null> {
+        if (this.unavailable.has(signature)) return null;
+        return this.txs.find(t => t.signature === signature)?.events ?? null;
+    }
 
     async clusterTime() {
         return this.now;
@@ -46,29 +134,25 @@ export class FakeChain implements Chain {
         );
     }
     async charge(req: ChargeRequest, onSigned: (s: string) => Promise<void>) {
-        const sig = `sig${++this.sigCounter}`;
+        // The signature is known before sending, as with a real signed transaction.
+        const sig = `sig${this.sigCounter + 1}`;
         await onSigned(sig);
         this.sent.push(req);
         if (this.failNext) {
             const e = this.failNext;
             this.failNext = null;
-            throw e;
+            this.record([], { failed: true, addresses: [req.subscription.address] });
+            throw new ChargeError(e.reason, e.message, sig);
         }
-        const s = this.subs.get(req.subscription.address)!;
-        const plan = this.plans.get(s.plan)!;
-        const { periodStartTs, pulled } = effectivePeriod(
-            {
-                amountPerPeriod: s.amount,
-                periodHours: s.periodHours,
-                currentPeriodStartTs: s.currentPeriodStartTs,
-                amountPulledInPeriod: s.amountPulledInPeriod,
-                expiresAtTs: s.expiresAtTs,
-            },
-            plan.endTs,
-            this.now,
-        );
-        if (pulled + req.amount > s.amount) throw new ChargeError('program_error', 'program error 400', sig);
-        this.subs.set(s.address, { ...s, currentPeriodStartTs: periodStartTs, amountPulledInPeriod: pulled + req.amount });
+        let transfer: ProgramEvent;
+        try {
+            transfer = this.applyPull(req.subscription.address, req.amount, this.signerAddress!);
+        } catch (err) {
+            this.record([], { failed: true, addresses: [req.subscription.address] });
+            throw new ChargeError('program_error', (err as Error).message, sig);
+        }
+        const recorded = this.record([transfer]);
+        if (recorded !== sig) throw new Error('fake chain signature drift');
         this.signatures.set(sig, { status: 'succeeded' });
         return sig;
     }
