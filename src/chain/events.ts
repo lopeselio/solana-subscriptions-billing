@@ -7,7 +7,9 @@
  * program whose first account is the event authority is an authentic event.
  *
  * Layouts are those of program v0.4.0+ (deployed v0.5.0). New program versions append fields
- * without moving existing ones, so longer payloads are accepted and decoded by prefix.
+ * without moving existing ones, so longer payloads are accepted and decoded by prefix. History
+ * from v0.3.0 (mainnet 2026-06-01 to 2026-07-13) lacks fields v0.4.0 appended; those decode as
+ * null.
  */
 import {
     type Address,
@@ -28,7 +30,15 @@ export const EVENT_IX_TAG = new Uint8Array([228, 69, 165, 46, 81, 203, 154, 29])
 const ZERO_ADDRESS = '11111111111111111111111111111111';
 
 export type ProgramEvent =
-    | { kind: 'subscription_created'; plan: Address; subscriber: Address; mint: Address; createdTs: bigint; payer: Address }
+    | {
+          kind: 'subscription_created';
+          plan: Address;
+          subscriber: Address;
+          mint: Address;
+          createdTs: bigint;
+          /** Null for v0.3.0 events. */
+          payer: Address | null;
+      }
     | { kind: 'subscription_cancelled'; plan: Address; subscriber: Address; expiresAtTs: bigint }
     | {
           kind: 'subscription_transfer';
@@ -43,8 +53,10 @@ export type ProgramEvent =
           periodEndTs: bigint;
           amountPulledInPeriod: bigint;
           receiver: Address;
-          receiverTokenAccount: Address;
-          puller: Address;
+          /** Null for v0.3.0 events. */
+          receiverTokenAccount: Address | null;
+          /** Null for v0.3.0 events. */
+          puller: Address | null;
       }
     | { kind: 'subscription_resumed'; plan: Address; subscriber: Address; resumedTs: bigint }
     | { kind: 'plan_updated'; plan: Address; owner: Address; status: number; endTs: bigint; pullers: Address[] };
@@ -57,7 +69,9 @@ const i64 = getI64Decoder();
 
 // Field order mirrors each event's `write_inner`. Discriminators 3 and 4 (fixed / recurring
 // delegation transfers) are not plan-related and are ignored.
-const LAYOUTS: Record<number, { kind: EventKind; decoder: Decoder<object> & { fixedSize: number } }> = {
+type FixedDecoder = Decoder<object> & { fixedSize: number };
+/** `legacy`: the v0.3.0 layout (a prefix of the current one) and the fields it lacks. */
+const LAYOUTS: Record<number, { kind: EventKind; decoder: FixedDecoder; legacy?: { size: number; missing: string[] } }> = {
     0: {
         kind: 'subscription_created',
         decoder: getStructDecoder([
@@ -67,6 +81,7 @@ const LAYOUTS: Record<number, { kind: EventKind; decoder: Decoder<object> & { fi
             ['createdTs', i64],
             ['payer', addr],
         ]),
+        legacy: { size: 104, missing: ['payer'] },
     },
     1: {
         kind: 'subscription_cancelled',
@@ -91,6 +106,7 @@ const LAYOUTS: Record<number, { kind: EventKind; decoder: Decoder<object> & { fi
             ['receiverTokenAccount', addr],
             ['puller', addr],
         ]),
+        legacy: { size: 192, missing: ['receiverTokenAccount', 'puller'] },
     },
     5: {
         kind: 'subscription_resumed',
@@ -118,8 +134,19 @@ export function decodeEvent(data: Uint8Array): ProgramEvent | null {
     const layout = LAYOUTS[data[8]!];
     if (!layout) return null;
     const payload = data.subarray(9);
-    if (payload.length < layout.decoder.fixedSize) return null;
-    const fields = layout.decoder.decode(payload.subarray(0, layout.decoder.fixedSize)) as Record<string, unknown>;
+    const full = layout.decoder.fixedSize;
+    let fields: Record<string, unknown>;
+    if (payload.length >= full) {
+        fields = layout.decoder.decode(payload.subarray(0, full)) as Record<string, unknown>;
+    } else if (layout.legacy && payload.length === layout.legacy.size) {
+        // Zero-pad to the current layout, decode, then null out the fields v0.3.0 didn't have.
+        const padded = new Uint8Array(full);
+        padded.set(payload);
+        fields = layout.decoder.decode(padded) as Record<string, unknown>;
+        for (const f of layout.legacy.missing) fields[f] = null;
+    } else {
+        return null;
+    }
     if (layout.kind === 'plan_updated') {
         fields.pullers = (fields.pullers as Address[]).filter(p => p !== ZERO_ADDRESS);
     }

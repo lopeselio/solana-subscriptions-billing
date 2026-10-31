@@ -96,6 +96,21 @@ describe('decodeEvent', () => {
         expect(decodeEvent(bytes)).toEqual({ kind: 'plan_updated', plan: a(2), owner: a(9), status: 1, endTs: 0n, pullers: [a(7)] });
     });
 
+    it('decodes v0.3.0 events, which lack the fields v0.4.0 appended', () => {
+        const v03Transfer = transferBytes.subarray(0, 9 + 192); // up to and including `receiver`
+        expect(decodeEvent(v03Transfer)).toMatchObject({
+            kind: 'subscription_transfer',
+            amount: 1_000_000n,
+            receiver: a(5),
+            receiverTokenAccount: null,
+            puller: null,
+        });
+        const v03Created = event(0, key(a(2)), key(a(3)), key(a(4)), le64(42n)); // no payer
+        expect(decodeEvent(v03Created)).toMatchObject({ kind: 'subscription_created', createdTs: 42n, payer: null });
+        // Anything between the two layouts is malformed.
+        expect(decodeEvent(transferBytes.subarray(0, 9 + 200))).toBeNull();
+    });
+
     it('accepts appended fields from newer program versions, rejects truncated or foreign data', () => {
         expect(decodeEvent(Buffer.concat([transferBytes, Buffer.alloc(8)]))?.kind).toBe('subscription_transfer');
         expect(decodeEvent(transferBytes.subarray(0, transferBytes.length - 1))).toBeNull();
