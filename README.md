@@ -13,6 +13,7 @@ enforcement." This service is that missing off-chain layer:
 | **Worker**     | Charges each due period via `transferSubscription` as the plan owner or a whitelisted puller.    |
 | **Retries**    | Preflights balance/delegate off-chain, classifies failures, retries on a configurable schedule. |
 | **API**        | Subscription state, charge history, and a `GET /entitlements/:wallet` access check.            |
+| **Webhooks**   | Signed [Standard Webhooks](https://www.standardwebhooks.com) for payments and subscription changes. |
 
 No changes to the audited program; it builds on `@solana/subscriptions`.
 
@@ -24,7 +25,7 @@ cp .env.example .env            # edit RPC_URL, KEYPAIR_PATH, ...
 pnpm billing migrate
 pnpm billing sync               # one snapshot
 pnpm billing charge             # one charge cycle (needs KEYPAIR_PATH)
-pnpm dev                        # sync + charge loops + API on :8787
+pnpm dev                        # sync + charge + webhook loops, API on :8787
 ```
 
 With no `DATABASE_URL`, data goes to an embedded Postgres (PGlite) in `./.data`. For production use
@@ -77,8 +78,58 @@ the balance is short.
 | `cancelled`, `plan_ended`, `not_started` | no |                                              |
 
 Other endpoints: `GET /plans`, `GET /plans/:address`, `GET /subscriptions/:address`,
-`GET /charges?status=failed`. Set `API_KEY` to require `Authorization: Bearer <key>`; otherwise
+`GET /charges?status=failed`, `GET /events` (see [Webhooks](#webhooks)). Set `API_KEY` to require `Authorization: Bearer <key>`; otherwise
 keep the API bound to localhost.
+
+## Webhooks
+
+Every subscription and payment change is recorded as an event in the same SQL statement as the
+change itself, so an event is never lost or emitted for a change that didn't commit. Set
+`WEBHOOK_URL` to have them POSTed to you:
+
+```bash
+pnpm billing webhook-secret     # prints whsec_...; put it in WEBHOOK_SECRET
+```
+
+| Event                    | When                                                                     |
+| ------------------------ | ------------------------------------------------------------------------ |
+| `subscription.created`   | a subscription is first seen (or reappears after being closed)           |
+| `subscription.cancelled` | the subscriber cancelled; `data.expiresAtTs` is when access ends         |
+| `subscription.closed`    | the subscription account no longer exists on-chain                       |
+| `payment.succeeded`      | this worker's charge landed; `data.signature` is the transaction         |
+| `payment.failed`         | a charge attempt failed; `data.reason`, `data.nextRetryAt`, `data.final` |
+
+```json
+{
+  "id": "evt_5f0c...",
+  "type": "payment.succeeded",
+  "timestamp": "2026-10-31T12:00:00.000Z",
+  "data": {
+    "subscription": "...", "plan": "...", "subscriber": "...", "mint": "...",
+    "amount": "1000000", "periodStartTs": "1793448000", "attemptNo": 1, "signature": "..."
+  }
+}
+```
+
+Token amounts and timestamps are strings (u64). Requests carry `webhook-id`, `webhook-timestamp`
+and `webhook-signature` headers per the Standard Webhooks spec, so any of its libraries verifies them:
+
+```ts
+import { Webhook } from 'standardwebhooks';
+const event = new Webhook(process.env.WEBHOOK_SECRET).verify(rawBody, headers); // throws if invalid
+```
+
+- **At-least-once.** Dedupe on `webhook-id` (the event id, stable across retries). Order is
+  oldest-first but not guaranteed across retries.
+- **Retries.** Any non-2xx response, redirect, or timeout (`WEBHOOK_TIMEOUT_MS`) is retried on
+  `WEBHOOK_RETRY_SCHEDULE_SECS` (10s up to 24h, about 2 days in total), then marked `failed`.
+  `POST /events/:id/redeliver` queues one again.
+- **Rotation.** `WEBHOOK_SECRET` takes a comma-separated list; every request is signed with each,
+  so receivers keep verifying while they switch to the new one.
+- **Polling instead.** The same events are at `GET /events?after=<id>&type=&limit=`; events are
+  recorded whether or not `WEBHOOK_URL` is set (and delivered from the start once it is).
+- `payment.*` covers charges made by this worker. Pulls by other pullers show up as changes in
+  the subscription snapshot; a full on-chain ledger needs event ingestion (see roadmap).
 
 ## Security notes
 
@@ -86,6 +137,9 @@ keep the API bound to localhost.
   puller key over the merchant key — the merchant can rotate pullers with `updatePlan` if it leaks.
 - `KEYPAIR_PATH` is a plain keypair file. Use a secrets manager / KMS-backed signer in production.
 - Funds can only go to the plan's whitelisted `destinations` (or anywhere, if none are set).
+- Verify webhook signatures and reject stale `webhook-timestamp`s (the libraries do both).
+  Webhooks are notifications: before granting something valuable, confirm with
+  `GET /entitlements/:wallet` or the transaction `signature`.
 
 ## Status and roadmap
 
@@ -95,10 +149,12 @@ v0.1. Tested three ways:
 - read-only sync of real devnet data (~1k plans, ~900 subscriptions);
 - end-to-end on Surfpool (mainnet fork, the deployed program, real USDC): the worker charges as a
   whitelisted puller, creates the merchant's token account, blocks an underfunded subscriber in
-  preflight without sending, charges again only in the next period, and stops after cancellation.
+  preflight without sending, charges again only in the next period, stops after cancellation, and
+  delivers every resulting event as a webhook that the reference `standardwebhooks` library verifies.
 
 - [x] End-to-end test against Surfpool
-- [ ] Signed webhooks (`payment.succeeded`, `payment.failed`, `subscription.cancelled`, ...)
+- [x] Signed webhooks (`payment.succeeded`, `payment.failed`, `subscription.cancelled`, ...)
+- [ ] `subscription.past_due` / entitlement-change events (time-based, needs a scheduler pass)
 - [ ] Event ingestion (self-CPI events) for a full payment ledger, including pulls by other pullers
 - [ ] Batching several charges per transaction
 - [ ] Plan metadata JSON schema for `metadataUri`
