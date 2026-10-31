@@ -89,10 +89,15 @@ keep the API bound to localhost.
 
 ## Status and roadmap
 
-v0.1. Tested against an in-memory chain and real devnet reads (indexing ~1k plans). Not yet
-exercised: an end-to-end charge on Surfpool/devnet.
+v0.1. Tested three ways:
 
-- [ ] End-to-end test against Surfpool
+- unit and engine tests against an in-memory chain and embedded Postgres;
+- read-only sync of real devnet data (~1k plans, ~900 subscriptions);
+- end-to-end on Surfpool (mainnet fork, the deployed program, real USDC): the worker charges as a
+  whitelisted puller, creates the merchant's token account, blocks an underfunded subscriber in
+  preflight without sending, charges again only in the next period, and stops after cancellation.
+
+- [x] End-to-end test against Surfpool
 - [ ] Signed webhooks (`payment.succeeded`, `payment.failed`, `subscription.cancelled`, ...)
 - [ ] Event ingestion (self-CPI events) for a full payment ledger, including pulls by other pullers
 - [ ] Batching several charges per transaction
@@ -101,9 +106,20 @@ exercised: an end-to-end charge on Surfpool/devnet.
 ## Development
 
 ```bash
-pnpm test        # unit + engine tests (embedded Postgres, fake chain)
+pnpm test        # unit + engine tests (embedded Postgres, fake chain); e2e is skipped
 pnpm typecheck
 ```
+
+End-to-end against a local [Surfpool](https://github.com/txtx/surfpool) mainnet fork. The program
+and USDC are loaded from mainnet on demand; time travel and token balances use Surfpool cheatcodes.
+
+```bash
+surfpool start --ci --no-tui --no-deploy --network mainnet   # in another terminal
+pnpm test:e2e
+```
+
+Use Surfpool **1.6 or newer** (release binaries on GitHub). The Homebrew tap currently ships 1.0.0,
+which rejects the program's `createPlan` with "insufficient funds for rent".
 
 ## License
 
