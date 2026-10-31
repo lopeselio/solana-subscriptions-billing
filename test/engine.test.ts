@@ -1,4 +1,3 @@
-import pino from 'pino';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { buildServer } from '../src/api/server.js';
@@ -6,57 +5,13 @@ import { ChargeError } from '../src/chain/types.js';
 import { connectPglite, type Db, migrate } from '../src/db/db.js';
 import { Repo } from '../src/db/repo.js';
 import { syncOnce } from '../src/indexer/sync.js';
-import { runChargeCycle, type WorkerConfig } from '../src/worker/charge.js';
+import { runChargeCycle } from '../src/worker/charge.js';
 import { FakeChain } from './fake-chain.js';
-
-const log = pino({ level: 'silent' });
-const HOUR = 3600n;
-const MERCHANT = 'Merchant1111111111111111111111111111111111';
-const PULLER = 'Puller11111111111111111111111111111111111111';
-const ALICE = 'Alice111111111111111111111111111111111111111';
-const PLAN = 'Plan1111111111111111111111111111111111111111';
-const SUB = 'SubA1111111111111111111111111111111111111111';
-const MINT = 'Mint1111111111111111111111111111111111111111';
-
-const cfg: WorkerConfig = {
-    retryScheduleSecs: [60, 600],
-    pendingTimeoutSecs: 180,
-    maxChargesPerCycle: 100,
-    dryRun: false,
-};
+import { ALICE, cfg, HOUR, log, MERCHANT, MINT, PLAN, PULLER, seed, SUB } from './fixtures.js';
 
 let db: Db;
 let repo: Repo;
 let chain: FakeChain;
-
-function seed(c: FakeChain) {
-    c.plans.set(PLAN, {
-        address: PLAN,
-        owner: MERCHANT,
-        planId: 1n,
-        mint: MINT,
-        amount: 500n,
-        periodHours: 720n,
-        termsCreatedAt: 1n,
-        endTs: 0n,
-        status: 1,
-        destinations: [],
-        pullers: [PULLER],
-        metadataUri: 'https://example.com/plan.json',
-    });
-    c.subs.set(SUB, {
-        address: SUB,
-        plan: PLAN,
-        subscriber: ALICE,
-        payer: ALICE,
-        amount: 500n,
-        periodHours: 720n,
-        termsCreatedAt: 1n,
-        amountPulledInPeriod: 0n,
-        currentPeriodStartTs: c.now,
-        expiresAtTs: 0n,
-    });
-}
 
 async function cycle() {
     await syncOnce({ repo, chain, scope: 'managed', log });
