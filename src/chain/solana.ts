@@ -15,6 +15,7 @@ import {
     getSignatureFromTransaction,
     type Instruction,
     isSolanaError,
+    isTransactionMessageWithinSizeLimit,
     type KeyPairSigner,
     pipe,
     type Signature,
@@ -277,17 +278,19 @@ export class SolanaChain implements Chain {
         };
     }
 
-    async charge(req: ChargeRequest, onSigned: (signature: string) => Promise<void>): Promise<string> {
+    async charge(reqs: readonly ChargeRequest[], onSigned: (signature: string) => Promise<void>): Promise<string> {
         const signer = this.opts.signer;
         if (!signer) throw new Error('charge() called without a signer configured');
+        const first = reqs[0];
+        if (!first) throw new Error('charge() called with no requests');
+        if (reqs.some(r => r.plan.address !== first.plan.address || r.destinationOwner !== first.destinationOwner)) {
+            throw new Error('a batch must share one plan and destination');
+        }
 
-        const mint = address(req.plan.mint);
-        const tokenProgram = await this.tokenProgramFor(req.plan.mint);
-        const subscriber = address(req.subscription.subscriber);
-        const destination = address(req.destinationOwner);
+        const mint = address(first.plan.mint);
+        const tokenProgram = await this.tokenProgramFor(first.plan.mint);
+        const destination = address(first.destinationOwner);
         const [receiverAta] = await findAssociatedTokenPda({ owner: destination, mint, tokenProgram });
-        const [sourceAta] = await findAssociatedTokenPda({ owner: subscriber, mint, tokenProgram });
-        const authority = address(await this.subscriptionAuthorityAddress(req.subscription.subscriber, req.plan.mint));
 
         const instructions: Instruction[] = [];
         if (this.opts.computeUnitPriceMicroLamports) {
@@ -306,28 +309,38 @@ export class SolanaChain implements Chain {
                 }),
             );
         }
-        const transferHookAccounts = await resolveTransferHookAccounts(this.rpc, {
-            amount: req.amount,
-            authority,
-            destination: receiverAta,
-            mint,
-            source: sourceAta,
-            tokenProgram,
-        });
-        instructions.push(
-            await getTransferSubscriptionOverlayInstructionAsync({
-                programAddress: this.programAddress,
+        // Instruction index of the first transfer, to map an InstructionError back to a request.
+        const transferOffset = instructions.length;
+        for (const req of reqs) {
+            const subscriber = address(req.subscription.subscriber);
+            const [sourceAta] = await findAssociatedTokenPda({ owner: subscriber, mint, tokenProgram });
+            const authority = address(await this.subscriptionAuthorityAddress(req.subscription.subscriber, req.plan.mint));
+            const transferHookAccounts = await resolveTransferHookAccounts(this.rpc, {
                 amount: req.amount,
-                caller: signer,
-                delegator: subscriber,
-                planPda: address(req.plan.address),
-                receiverAta,
-                subscriptionPda: address(req.subscription.address),
-                tokenMint: mint,
+                authority,
+                destination: receiverAta,
+                mint,
+                source: sourceAta,
                 tokenProgram,
-                transferHookAccounts,
-            }),
-        );
+            });
+            if (reqs.length > 1 && transferHookAccounts.length > 0) {
+                throw new ChargeError('transient', 'transfer-hook mints are charged one per transaction');
+            }
+            instructions.push(
+                await getTransferSubscriptionOverlayInstructionAsync({
+                    programAddress: this.programAddress,
+                    amount: req.amount,
+                    caller: signer,
+                    delegator: subscriber,
+                    planPda: address(req.plan.address),
+                    receiverAta,
+                    subscriptionPda: address(req.subscription.address),
+                    tokenMint: mint,
+                    tokenProgram,
+                    transferHookAccounts,
+                }),
+            );
+        }
 
         const { value: blockhash } = await this.rpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
         const message = pipe(
@@ -336,6 +349,9 @@ export class SolanaChain implements Chain {
             m => setTransactionMessageLifetimeUsingBlockhash(blockhash, m),
             m => appendTransactionMessageInstructions(instructions, m),
         );
+        if (!isTransactionMessageWithinSizeLimit(message)) {
+            throw new ChargeError('transient', `a batch of ${reqs.length} charges exceeds the transaction size limit`);
+        }
         const tx = await signTransactionMessageWithSigners(message);
         assertIsTransactionWithBlockhashLifetime(tx);
         const signature = getSignatureFromTransaction(tx);
@@ -344,7 +360,7 @@ export class SolanaChain implements Chain {
         try {
             await this.sendAndConfirm(tx, { commitment: 'confirmed' });
         } catch (err) {
-            throw classifySendError(err, signature);
+            throw classifySendError(err, signature, transferOffset, reqs.length);
         }
         return signature;
     }
@@ -387,10 +403,12 @@ function bigintReplacer(_k: string, v: unknown) {
 }
 
 /** Finds the custom program error code anywhere in a SolanaError cause chain. */
-function customErrorCode(err: unknown): number | null {
+function customError(err: unknown): { code: number; index: number } | null {
     let cur: unknown = err;
     for (let depth = 0; cur && depth < 8; depth++) {
-        if (isSolanaError(cur, SOLANA_ERROR__INSTRUCTION_ERROR__CUSTOM)) return Number(cur.context.code);
+        if (isSolanaError(cur, SOLANA_ERROR__INSTRUCTION_ERROR__CUSTOM)) {
+            return { code: Number(cur.context.code), index: Number(cur.context.index) };
+        }
         cur = (cur as { cause?: unknown }).cause;
     }
     return null;
@@ -407,11 +425,22 @@ const PROGRAM_ERROR_REASONS: Record<number, FailureReason> = {
     [SUBSCRIPTIONS_ERROR__AMOUNT_EXCEEDS_PERIOD_LIMIT]: 'program_error',
 };
 
-export function classifySendError(err: unknown, signature?: string): ChargeError {
+/**
+ * Maps a send/confirm error to a failure reason. `transferOffset`/`count` locate the transfer
+ * instructions so a batch failure names the request that caused it.
+ */
+export function classifySendError(err: unknown, signature?: string, transferOffset = 0, count = 1): ChargeError {
     const message = err instanceof Error ? err.message : String(err);
-    const code = customErrorCode(err);
-    if (code === null) return new ChargeError('transient', message, signature);
-    if (code === TOKEN_ERROR_INSUFFICIENT_FUNDS) return new ChargeError('insufficient_funds', message, signature);
-    if (code === TOKEN_ERROR_OWNER_MISMATCH) return new ChargeError('delegate_revoked', message, signature);
-    return new ChargeError(PROGRAM_ERROR_REASONS[code] ?? 'program_error', `program error ${code}: ${message}`, signature);
+    const custom = customError(err);
+    if (custom === null) return new ChargeError('transient', message, signature);
+    const i = custom.index - transferOffset;
+    const failedIndex = i >= 0 && i < count ? i : undefined;
+    const reason: FailureReason =
+        custom.code === TOKEN_ERROR_INSUFFICIENT_FUNDS
+            ? 'insufficient_funds'
+            : custom.code === TOKEN_ERROR_OWNER_MISMATCH
+              ? 'delegate_revoked'
+              : (PROGRAM_ERROR_REASONS[custom.code] ?? 'program_error');
+    const text = reason === 'insufficient_funds' || reason === 'delegate_revoked' ? message : `program error ${custom.code}: ${message}`;
+    return new ChargeError(reason, text, signature, failedIndex);
 }

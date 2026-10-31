@@ -14,6 +14,8 @@ export interface WorkerConfig {
     destinationOwner?: string;
     maxChargesPerCycle: number;
     dryRun: boolean;
+    /** Charges per transaction, for subscriptions of the same plan and destination. 1 = no batching. */
+    batchSize?: number;
 }
 
 export interface CycleResult {
@@ -72,12 +74,18 @@ export function mayAttempt(last: ChargeAttempt | null, now: Date): boolean {
     return last.nextRetryAt !== null && last.nextRetryAt <= now;
 }
 
-export async function runChargeCycle(deps: {
-    repo: Repo;
-    chain: Chain;
-    cfg: WorkerConfig;
-    log: Logger;
-}): Promise<CycleResult> {
+/** A due charge that passed preflight and has a pending attempt. */
+interface Prepared {
+    plan: PlanRecord;
+    sub: SubscriptionRecord;
+    attempt: ChargeAttempt;
+    amount: bigint;
+    destination: string;
+}
+
+type Deps = { repo: Repo; chain: Chain; cfg: WorkerConfig; log: Logger };
+
+export async function runChargeCycle(deps: Deps): Promise<CycleResult> {
     const { repo, chain, cfg, log } = deps;
     const result: CycleResult = { charged: 0, failed: 0, skipped: 0, reconciled: 0, wouldCharge: 0, unconfirmed: 0 };
     const signer = chain.signerAddress;
@@ -88,31 +96,41 @@ export async function runChargeCycle(deps: {
     const nowTs = await chain.clusterTime();
     const plans = (await repo.listPlans()).filter(p => canCharge(p, signer));
 
+    // 1. Decide and preflight every due subscription, within the cycle budget.
+    const ready: Prepared[] = [];
     let budget = cfg.maxChargesPerCycle;
-    for (const plan of plans) {
+    collect: for (const plan of plans) {
         for (const sub of await repo.listSubscriptions({ plan: plan.address })) {
             if (budget <= 0) {
                 log.warn('maxChargesPerCycle reached; remaining charges wait for the next cycle');
-                return result;
+                break collect;
             }
-            const outcome = await processSubscription({ ...deps, plan, sub, nowTs });
-            result[outcome]++;
+            const outcome = await prepare({ ...deps, plan, sub, nowTs });
+            if (typeof outcome === 'string') result[outcome]++;
+            else ready.push(outcome);
             if (outcome !== 'skipped') budget--;
+        }
+    }
+
+    // 2. Send, batching charges that share a plan and destination (they share most accounts).
+    const groups = new Map<string, Prepared[]>();
+    for (const p of ready) {
+        const key = `${p.plan.address}|${p.destination}`;
+        groups.set(key, [...(groups.get(key) ?? []), p]);
+    }
+    const size = Math.max(1, cfg.batchSize ?? 1);
+    for (const group of groups.values()) {
+        for (let i = 0; i < group.length; i += size) {
+            await send(deps, group.slice(i, i + size), result);
         }
     }
     log.info(result, 'charge cycle complete');
     return result;
 }
 
-async function processSubscription(deps: {
-    repo: Repo;
-    chain: Chain;
-    cfg: WorkerConfig;
-    log: Logger;
-    plan: PlanRecord;
-    sub: SubscriptionRecord;
-    nowTs: bigint;
-}): Promise<'charged' | 'failed' | 'skipped' | 'wouldCharge' | 'unconfirmed'> {
+async function prepare(
+    deps: Deps & { plan: PlanRecord; sub: SubscriptionRecord; nowTs: bigint },
+): Promise<'failed' | 'skipped' | 'wouldCharge' | Prepared> {
     const { repo, chain, cfg, plan, sub, nowTs } = deps;
     const log = deps.log.child({ subscription: sub.address, plan: plan.address });
 
@@ -145,7 +163,7 @@ async function processSubscription(deps: {
     });
     if (!attempt) return 'skipped'; // another worker got there first
 
-    // Preflight off-chain so predictable failures don't cost a transaction fee.
+    // Preflight off-chain so predictable failures don't cost a transaction fee (or sink a batch).
     const source = await chain.sourceAccountState(sub.subscriber, plan.mint);
     const authority = await chain.subscriptionAuthorityAddress(sub.subscriber, plan.mint);
     let preflight: [FailureReason, string] | null = null;
@@ -160,25 +178,52 @@ async function processSubscription(deps: {
         log.warn({ reason: preflight[0], attempt: attempt.attemptNo }, 'charge preflight failed');
         return 'failed';
     }
+    return { plan, sub, attempt, amount: state.amount, destination: pickDestination(plan, cfg.destinationOwner) };
+}
 
+/**
+ * Sends one transaction for `batch`. If a batch fails, the request the error points to is
+ * failed and the rest are retried one per transaction; if nothing was sent (e.g. too large),
+ * all are retried singly. An unknown outcome after sending leaves the attempts pending for
+ * reconciliation.
+ */
+async function send(deps: Deps, batch: Prepared[], result: CycleResult): Promise<void> {
+    const { repo, chain, cfg } = deps;
+    const log = deps.log.child({ plan: batch[0]!.plan.address, batch: batch.length });
     try {
         const signature = await chain.charge(
-            { plan, subscription: sub, amount: state.amount, destinationOwner: pickDestination(plan, cfg.destinationOwner) },
-            sig => repo.setAttemptSignature(attempt.id, sig),
+            batch.map(p => ({ plan: p.plan, subscription: p.sub, amount: p.amount, destinationOwner: p.destination })),
+            sig => Promise.all(batch.map(p => repo.setAttemptSignature(p.attempt.id, sig))).then(() => undefined),
         );
-        await repo.succeedAttempt(attempt.id, signature);
-        log.info({ signature, amount: state.amount.toString() }, 'charged');
-        return 'charged';
+        for (const p of batch) await repo.succeedAttempt(p.attempt.id, signature);
+        result.charged += batch.length;
+        log.info({ signature, subscriptions: batch.map(p => p.sub.address) }, 'charged');
     } catch (err) {
         const ce = err instanceof ChargeError ? err : new ChargeError('transient', String(err));
         if (ce.reason === 'transient' && ce.signature) {
-            // e.g. a confirmation timeout: the transaction may still land. Failing the attempt now
-            // would record money that moved as unpaid; reconcilePending settles it from the signature.
+            // e.g. a confirmation timeout: the transaction may still land. Failing the attempts now
+            // would record money that moved as unpaid; reconcilePending settles them from the signature.
             log.warn({ signature: ce.signature, error: ce.message }, 'charge outcome unknown; will reconcile');
-            return 'unconfirmed';
+            result.unconfirmed += batch.length;
+            return;
         }
-        await fail(repo, attempt, ce.reason, ce.message, cfg);
-        log.warn({ reason: ce.reason, error: ce.message, attempt: attempt.attemptNo }, 'charge failed');
-        return 'failed';
+        if (batch.length === 1) {
+            const [p] = batch as [Prepared];
+            await fail(repo, p.attempt, ce.reason, ce.message, cfg);
+            result.failed++;
+            log.warn({ subscription: p.sub.address, reason: ce.reason, error: ce.message }, 'charge failed');
+            return;
+        }
+        let rest = batch;
+        if (ce.failedIndex !== undefined && batch[ce.failedIndex]) {
+            const culprit = batch[ce.failedIndex]!;
+            await fail(repo, culprit.attempt, ce.reason, ce.message, cfg);
+            result.failed++;
+            log.warn({ subscription: culprit.sub.address, reason: ce.reason }, 'charge failed; batch retried singly');
+            rest = batch.filter(p => p !== culprit);
+        } else {
+            log.warn({ error: ce.message }, 'batch failed; retrying singly');
+        }
+        for (const p of rest) await send(deps, [p], result);
     }
 }

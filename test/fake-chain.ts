@@ -23,6 +23,12 @@ export class FakeChain implements Chain {
     signatures = new Map<string, SignatureOutcome>();
     /** Next charge throws this, once. */
     failNext: ChargeError | null = null;
+    /** Transfers per charge transaction, in order. */
+    batches: number[] = [];
+    /** Largest batch that fits in a transaction; bigger ones fail before sending. */
+    batchLimit = Infinity;
+    /** Charges for these subscriptions fail on-chain with this error, at their instruction. */
+    rejects = new Map<string, ChargeError>();
     /** Next charge lands on-chain but the client sees a confirmation timeout. */
     timeoutAfterLandingNext = false;
     /** Transaction history, oldest first, as getSignaturesForAddress would see it. */
@@ -135,25 +141,39 @@ export class FakeChain implements Chain {
             }
         );
     }
-    async charge(req: ChargeRequest, onSigned: (s: string) => Promise<void>) {
+    async charge(reqs: readonly ChargeRequest[], onSigned: (s: string) => Promise<void>) {
+        if (reqs.length > this.batchLimit) throw new ChargeError('transient', `batch of ${reqs.length} too large`);
         // The signature is known before sending, as with a real signed transaction.
         const sig = `sig${this.sigCounter + 1}`;
         await onSigned(sig);
-        this.sent.push(req);
+        this.sent.push(...reqs);
+        this.batches.push(reqs.length);
+        const touched = reqs.map(r => r.subscription.address);
+        const failTx = (e: ChargeError, index?: number) => {
+            this.record([], { failed: true, addresses: touched });
+            this.signatures.set(sig, { status: 'failed', error: e.message });
+            return new ChargeError(e.reason, e.message, sig, index);
+        };
         if (this.failNext) {
             const e = this.failNext;
             this.failNext = null;
-            this.record([], { failed: true, addresses: [req.subscription.address] });
-            throw new ChargeError(e.reason, e.message, sig);
+            throw failTx(e);
         }
-        let transfer: ProgramEvent;
-        try {
-            transfer = this.applyPull(req.subscription.address, req.amount, this.signerAddress!);
-        } catch (err) {
-            this.record([], { failed: true, addresses: [req.subscription.address] });
-            throw new ChargeError('program_error', (err as Error).message, sig);
+        const culprit = reqs.findIndex(r => this.rejects.has(r.subscription.address));
+        if (culprit >= 0) throw failTx(this.rejects.get(reqs[culprit]!.subscription.address)!, culprit);
+
+        // All or nothing, like a transaction.
+        const saved = new Map(this.subs);
+        const transfers: ProgramEvent[] = [];
+        for (const [i, req] of reqs.entries()) {
+            try {
+                transfers.push(this.applyPull(req.subscription.address, req.amount, this.signerAddress!));
+            } catch (err) {
+                this.subs = saved;
+                throw failTx(err as ChargeError, i);
+            }
         }
-        const recorded = this.record([transfer]);
+        const recorded = this.record(transfers, { addresses: touched });
         if (recorded !== sig) throw new Error('fake chain signature drift');
         this.signatures.set(sig, { status: 'succeeded' });
         if (this.timeoutAfterLandingNext) {

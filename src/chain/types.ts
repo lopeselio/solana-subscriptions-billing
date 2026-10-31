@@ -36,6 +36,8 @@ export class ChargeError extends Error {
         readonly reason: FailureReason,
         message: string,
         readonly signature?: string,
+        /** For a batch: which request's instruction failed, when the error says. */
+        readonly failedIndex?: number,
     ) {
         super(message);
     }
@@ -56,10 +58,12 @@ export interface Chain {
     subscriptionAuthorityAddress(subscriber: string, mint: string): Promise<string>;
     sourceAccountState(subscriber: string, mint: string): Promise<SourceAccountState>;
     /**
-     * Sends a transferSubscription and waits for confirmation. `onSigned` runs before the
-     * transaction is sent so the caller can persist the signature for crash recovery.
+     * Sends one transaction with a transferSubscription per request (all for the same plan and
+     * destination) and waits for confirmation; all succeed or none do. `onSigned` runs before the
+     * transaction is sent so the caller can persist the signature for crash recovery. A ChargeError
+     * without a signature means nothing was sent (e.g. the batch doesn't fit in a transaction).
      */
-    charge(req: ChargeRequest, onSigned: (signature: string) => Promise<void>): Promise<string>;
+    charge(reqs: readonly ChargeRequest[], onSigned: (signature: string) => Promise<void>): Promise<string>;
     signatureOutcome(signature: string): Promise<SignatureOutcome>;
 
     /** The subscriptions program address (the history source for program-wide ingestion). */
