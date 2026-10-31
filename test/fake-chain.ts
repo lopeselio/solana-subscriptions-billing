@@ -23,6 +23,8 @@ export class FakeChain implements Chain {
     signatures = new Map<string, SignatureOutcome>();
     /** Next charge throws this, once. */
     failNext: ChargeError | null = null;
+    /** Next charge lands on-chain but the client sees a confirmation timeout. */
+    timeoutAfterLandingNext = false;
     /** Transaction history, oldest first, as getSignaturesForAddress would see it. */
     txs: (SignatureInfo & { addresses: string[]; events: ProgramEvent[] })[] = [];
     /** Signatures whose transaction getTransaction can't return yet. */
@@ -154,6 +156,10 @@ export class FakeChain implements Chain {
         const recorded = this.record([transfer]);
         if (recorded !== sig) throw new Error('fake chain signature drift');
         this.signatures.set(sig, { status: 'succeeded' });
+        if (this.timeoutAfterLandingNext) {
+            this.timeoutAfterLandingNext = false;
+            throw new ChargeError('transient', 'confirmation timed out', sig);
+        }
         return sig;
     }
     async signatureOutcome(sig: string): Promise<SignatureOutcome> {

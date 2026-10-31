@@ -116,6 +116,19 @@ describe('charging', () => {
         expect((await repo.listAttempts({ subscription: SUB }))[0]?.status).toBe('succeeded');
     });
 
+    it('records a charge that landed despite a confirmation timeout', async () => {
+        chain.timeoutAfterLandingNext = true;
+        expect(await cycle()).toMatchObject({ charged: 0, failed: 0, unconfirmed: 1 });
+        const [pending] = await repo.listAttempts({ subscription: SUB });
+        expect(pending).toMatchObject({ status: 'pending', signature: 'sig1' });
+
+        const next = await cycle(); // reconcile finds the signature succeeded; the period is now paid
+        expect(next).toMatchObject({ reconciled: 1, charged: 0 });
+        expect(chain.sent).toHaveLength(1);
+        expect((await repo.listAttempts({ subscription: SUB }))[0]?.status).toBe('succeeded');
+        expect(await repo.listEvents({ type: 'payment.succeeded' })).toHaveLength(1);
+    });
+
     it('refuses a second live attempt for the same period', async () => {
         await syncOnce({ repo, chain, scope: 'managed', log });
         const first = await repo.beginAttempt({ subscription: SUB, plan: PLAN, periodStartTs: 5n, amount: 1n });

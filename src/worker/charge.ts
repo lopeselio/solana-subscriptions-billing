@@ -22,6 +22,8 @@ export interface CycleResult {
     skipped: number;
     reconciled: number;
     wouldCharge: number;
+    /** Sent, but confirmation failed; left pending for reconciliation from the signature. */
+    unconfirmed: number;
 }
 
 export function pickDestination(plan: PlanRecord, preferred?: string): string {
@@ -77,7 +79,7 @@ export async function runChargeCycle(deps: {
     log: Logger;
 }): Promise<CycleResult> {
     const { repo, chain, cfg, log } = deps;
-    const result: CycleResult = { charged: 0, failed: 0, skipped: 0, reconciled: 0, wouldCharge: 0 };
+    const result: CycleResult = { charged: 0, failed: 0, skipped: 0, reconciled: 0, wouldCharge: 0, unconfirmed: 0 };
     const signer = chain.signerAddress;
     if (!signer) throw new Error('worker requires a signer');
 
@@ -95,7 +97,7 @@ export async function runChargeCycle(deps: {
             }
             const outcome = await processSubscription({ ...deps, plan, sub, nowTs });
             result[outcome]++;
-            if (outcome === 'charged' || outcome === 'failed' || outcome === 'wouldCharge') budget--;
+            if (outcome !== 'skipped') budget--;
         }
     }
     log.info(result, 'charge cycle complete');
@@ -110,7 +112,7 @@ async function processSubscription(deps: {
     plan: PlanRecord;
     sub: SubscriptionRecord;
     nowTs: bigint;
-}): Promise<'charged' | 'failed' | 'skipped' | 'wouldCharge'> {
+}): Promise<'charged' | 'failed' | 'skipped' | 'wouldCharge' | 'unconfirmed'> {
     const { repo, chain, cfg, plan, sub, nowTs } = deps;
     const log = deps.log.child({ subscription: sub.address, plan: plan.address });
 
@@ -169,6 +171,12 @@ async function processSubscription(deps: {
         return 'charged';
     } catch (err) {
         const ce = err instanceof ChargeError ? err : new ChargeError('transient', String(err));
+        if (ce.reason === 'transient' && ce.signature) {
+            // e.g. a confirmation timeout: the transaction may still land. Failing the attempt now
+            // would record money that moved as unpaid; reconcilePending settles it from the signature.
+            log.warn({ signature: ce.signature, error: ce.message }, 'charge outcome unknown; will reconcile');
+            return 'unconfirmed';
+        }
         await fail(repo, attempt, ce.reason, ce.message, cfg);
         log.warn({ reason: ce.reason, error: ce.message, attempt: attempt.attemptNo }, 'charge failed');
         return 'failed';
