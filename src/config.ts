@@ -26,6 +26,8 @@ const schema = z.object({
     RETRY_SCHEDULE_SECS: csvNumbers.default([3600, 6 * 3600, 24 * 3600, 72 * 3600]),
     PENDING_TIMEOUT_SECS: z.coerce.number().int().positive().default(180),
     MAX_CHARGES_PER_CYCLE: z.coerce.number().int().positive().default(200),
+    /** Charges per transaction for one plan. 4 is the most that fits (1232-byte limit); 1 disables. */
+    CHARGE_BATCH_SIZE: z.coerce.number().int().min(1).max(16).default(4),
     COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: z.coerce.bigint().default(0n),
     DRY_RUN: z
         .enum(['true', 'false', '1', '0'])

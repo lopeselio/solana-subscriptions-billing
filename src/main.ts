@@ -91,6 +91,7 @@ async function main() {
         destinationOwner: cfg.DESTINATION_OWNER,
         maxChargesPerCycle: cfg.MAX_CHARGES_PER_CYCLE,
         dryRun: cfg.DRY_RUN,
+        batchSize: cfg.CHARGE_BATCH_SIZE,
     };
     // Snapshot, then the event ledger (new plans first get a cursor), then an entitlement pass so
     // time-based changes are announced too.
