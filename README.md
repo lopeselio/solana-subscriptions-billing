@@ -98,6 +98,13 @@ pnpm billing webhook-secret     # prints whsec_...; put it in WEBHOOK_SECRET
 | `subscription.closed`    | the subscription account no longer exists on-chain                       |
 | `payment.succeeded`      | this worker's charge landed; `data.signature` is the transaction         |
 | `payment.failed`         | a charge attempt failed; `data.reason`, `data.nextRetryAt`, `data.final` |
+| `entitlement.changed`    | access status changed; `data.previousStatus`, `data.status`, `data.entitled`, `data.accessUntilTs` |
+
+`entitlement.changed` is the one to grant and revoke access on. It uses the statuses from
+[Entitlements](#entitlements) plus `closed`, and also fires for changes caused only by time passing
+(grace running out → `past_due`, a cancelled subscription reaching `expiresAtTs` → `cancelled`,
+the plan's `endTs` → `plan_ended`). It is evaluated at cluster time after every sync, so it lags
+by up to `SYNC_INTERVAL_SECS`; the first evaluation of a subscription has `previousStatus: null`.
 
 ```json
 {
@@ -150,11 +157,13 @@ v0.1. Tested three ways:
 - end-to-end on Surfpool (mainnet fork, the deployed program, real USDC): the worker charges as a
   whitelisted puller, creates the merchant's token account, blocks an underfunded subscriber in
   preflight without sending, charges again only in the next period, stops after cancellation, and
-  delivers every resulting event as a webhook that the reference `standardwebhooks` library verifies.
+  announces entitlement changes (an unpaid subscriber going `past_due`, access ending after
+  cancellation), and delivers every resulting event as a webhook that the reference
+  `standardwebhooks` library verifies.
 
 - [x] End-to-end test against Surfpool
 - [x] Signed webhooks (`payment.succeeded`, `payment.failed`, `subscription.cancelled`, ...)
-- [ ] `subscription.past_due` / entitlement-change events (time-based, needs a scheduler pass)
+- [x] `entitlement.changed` events, including time-based changes (`past_due`, access ending)
 - [ ] Event ingestion (self-CPI events) for a full payment ledger, including pulls by other pullers
 - [ ] Batching several charges per transaction
 - [ ] Plan metadata JSON schema for `metadataUri`
