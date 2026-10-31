@@ -126,7 +126,7 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         await new Promise(r => setTimeout(r, 1500));
     }
 
-    async function subscribe(user: KeyPairSigner) {
+    async function subscribe(user: KeyPairSigner, plan = { pda: planPda, id: planId }) {
         const [userAta] = await findAssociatedTokenPda({ owner: user.address, mint: USDC, tokenProgram: TOKEN_PROGRAM_ADDRESS });
         await send(user, [
             await getInitSubscriptionAuthorityOverlayInstructionAsync({
@@ -138,20 +138,20 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         ]);
         const [sa] = await findSubscriptionAuthorityPda({ user: user.address, tokenMint: USDC });
         const { data: authority } = await fetchSubscriptionAuthority(rpc, sa);
-        const { data: plan } = await fetchPlan(rpc, planPda);
+        const { data: planAccount } = await fetchPlan(rpc, plan.pda);
         await send(user, [
             await getSubscribeOverlayInstructionAsync({
                 subscriber: user,
                 merchant: merchant.address,
-                planId,
+                planId: plan.id,
                 tokenMint: USDC,
-                expectedAmount: plan.data.terms.amount,
-                expectedPeriodHours: plan.data.terms.periodHours,
-                expectedCreatedAt: plan.data.terms.createdAt,
+                expectedAmount: planAccount.data.terms.amount,
+                expectedPeriodHours: planAccount.data.terms.periodHours,
+                expectedCreatedAt: planAccount.data.terms.createdAt,
                 expectedSubscriptionAuthorityInitId: authority.initId,
             }),
         ]);
-        const [sub] = await findSubscriptionDelegationPda({ planPda, subscriber: user.address });
+        const [sub] = await findSubscriptionDelegationPda({ planPda: plan.pda, subscriber: user.address });
         return sub;
     }
 
@@ -375,4 +375,55 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
             await new Promise(r => server.close(r));
         }
     }, 60_000);
+
+    it('batches charges for one plan: 5 subscribers go out as 4 + 1 transactions', async () => {
+        const id = planId + 1n;
+        const [pda] = await findPlanPda({ owner: merchant.address, planId: id });
+        await send(merchant, [
+            await getCreatePlanOverlayInstructionAsync({
+                owner: merchant,
+                planId: id,
+                mint: USDC,
+                amount: PRICE,
+                periodHours: PERIOD_HOURS,
+                endTs: 0,
+                destinations: [merchant.address],
+                pullers: [puller.address],
+                metadataUri: 'https://example.com/e2e-batch-plan.json',
+                tokenProgram: TOKEN_PROGRAM_ADDRESS,
+            }),
+        ]);
+        const users = await Promise.all(Array.from({ length: 5 }, () => generateKeyPairSigner()));
+        for (const u of users) await rpc.requestAirdrop(u.address, lamports(1_000_000_000n)).send();
+        for (const u of users) {
+            for (let i = 0; (await rpc.getBalance(u.address).send()).value === 0n; i++) {
+                if (i > 50) throw new Error('airdrop never landed');
+                await new Promise(r => setTimeout(r, 200));
+            }
+            await cheat('surfnet_setTokenAccount', [u.address, USDC, { amount: 3_000_000 }, TOKEN_PROGRAM_ADDRESS]);
+        }
+        const subs = [];
+        for (const u of users) subs.push(await subscribe(u, { pda, id }));
+
+        const before = await usdcBalance(merchant.address);
+        await syncOnce({ repo, chain, scope: 'managed', log });
+        await runChargeCycle({ repo, chain, cfg: { ...cfg, batchSize: 4 }, log });
+
+        const sigs = await Promise.all(subs.map(async s => (await repo.listAttempts({ subscription: s }))[0]));
+        expect(sigs.every(a => a?.status === 'succeeded')).toBe(true);
+        const bySig = new Map<string, number>();
+        for (const a of sigs) bySig.set(a!.signature!, (bySig.get(a!.signature!) ?? 0) + 1);
+        expect([...bySig.values()].sort()).toEqual([1, 4]);
+        expect(await usdcBalance(merchant.address)).toBe(before + 5n * PRICE);
+        for (const u of users) expect(await usdcBalance(u.address)).toBe(3_000_000n - PRICE);
+
+        // The 4-transfer transaction's events are all matched to the worker's attempts.
+        await ingest();
+        const transfers = await repo.listChainEvents({ kind: 'subscription_transfer', plan: pda });
+        expect(transfers).toHaveLength(5);
+        expect(transfers.filter(t => t.signature === [...bySig].find(([, n]) => n === 4)![0]).map(t => t.eventIndex).sort())
+            .toEqual([0, 1, 2, 3]);
+        const chainSourced = (await repo.listEvents({ type: 'payment.succeeded' })).filter(e => e.data.plan === pda && e.data.source === 'chain');
+        expect(chainSourced).toHaveLength(0);
+    }, 180_000);
 });
