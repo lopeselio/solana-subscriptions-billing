@@ -94,7 +94,8 @@ pnpm billing webhook-secret     # prints whsec_...; put it in WEBHOOK_SECRET
 | Event                    | When                                                                     |
 | ------------------------ | ------------------------------------------------------------------------ |
 | `subscription.created`   | a subscription is first seen (or reappears after being closed)           |
-| `subscription.cancelled` | the subscriber cancelled; `data.expiresAtTs` is when access ends         |
+| `subscription.cancelled` | cancelled, or the end moved earlier (`CancelSubscriptionNow`); `data.expiresAtTs` is when access ends |
+| `subscription.resumed`   | the subscriber undid a pending cancellation (`ResumeSubscription`)       |
 | `subscription.closed`    | the subscription account no longer exists on-chain                       |
 | `payment.succeeded`      | this worker's charge landed; `data.signature` is the transaction         |
 | `payment.failed`         | a charge attempt failed; `data.reason`, `data.nextRetryAt`, `data.final` |

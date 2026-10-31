@@ -52,6 +52,7 @@ export interface ChargeAttempt {
 export type EventType =
     | 'subscription.created'
     | 'subscription.cancelled'
+    | 'subscription.resumed'
     | 'subscription.closed'
     | 'payment.succeeded'
     | 'payment.failed'
@@ -221,7 +222,8 @@ export class Repo {
 
     /**
      * Upserts a subscription snapshot. Emits `subscription.created` the first time an address is
-     * seen (or reappears after closing) and `subscription.cancelled` when `expiresAtTs` becomes set.
+     * seen (or reappears after closing), `subscription.cancelled` when `expiresAtTs` is set or moved,
+     * and `subscription.resumed` when it is cleared.
      */
     async upsertSubscription(s: Omit<SubscriptionRecord, 'closed'>): Promise<void> {
         await this.db.query(
@@ -244,7 +246,9 @@ export class Repo {
              LEFT JOIN prev ON TRUE
              CROSS JOIN LATERAL (SELECT CASE
                  WHEN prev.closed IS NULL OR prev.closed THEN 'subscription.created'
-                 WHEN prev.expires_at_ts = 0 AND up.expires_at_ts <> 0 THEN 'subscription.cancelled'
+                 -- also when CancelSubscriptionNow moves a pending cancellation earlier
+                 WHEN up.expires_at_ts <> 0 AND up.expires_at_ts <> prev.expires_at_ts THEN 'subscription.cancelled'
+                 WHEN prev.expires_at_ts <> 0 AND up.expires_at_ts = 0 THEN 'subscription.resumed'
              END AS type) ev
              WHERE ev.type IS NOT NULL`,
             [

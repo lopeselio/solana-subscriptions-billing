@@ -85,6 +85,30 @@ describe('event emission', () => {
         expect(cancelled[0]!.data.expiresAtTs).toBe(expiresAtTs.toString());
     });
 
+    it('emits subscription.resumed when a cancellation is undone, and cancelled again if moved', async () => {
+        await sync();
+        const s = chain.subs.get(SUB)!;
+        const end = s.currentPeriodStartTs + 720n * HOUR;
+        chain.subs.set(SUB, { ...s, expiresAtTs: end });
+        await sync();
+        chain.subs.set(SUB, { ...s, expiresAtTs: 0n }); // ResumeSubscription
+        await sync();
+        chain.subs.set(SUB, { ...s, expiresAtTs: end });
+        await sync();
+        chain.subs.set(SUB, { ...s, expiresAtTs: chain.now }); // CancelSubscriptionNow shortens it
+        await sync();
+        await sync();
+        expect(await types()).toEqual([
+            'subscription.created',
+            'subscription.cancelled',
+            'subscription.resumed',
+            'subscription.cancelled',
+            'subscription.cancelled',
+        ]);
+        const cancels = await ofType('subscription.cancelled');
+        expect(cancels.at(-1)!.data.expiresAtTs).toBe(chain.now.toString());
+    });
+
     it('emits subscription.closed when the account disappears, and created again if it comes back', async () => {
         await sync();
         const s = chain.subs.get(SUB)!;
