@@ -32,6 +32,20 @@ const schema = z.object({
         .default('false')
         .transform(v => v === 'true' || v === '1'),
 
+    /** Read the program's events from transaction history into the payment ledger. */
+    INGEST_EVENTS: z
+        .enum(['true', 'false', '1', '0'])
+        .default('true')
+        .transform(v => v === 'true' || v === '1'),
+    /** 'finalized' never records a transaction from a rolled-back fork; 'confirmed' is ~13s sooner. */
+    INGEST_COMMITMENT: z.enum(['confirmed', 'finalized']).default('finalized'),
+    INGEST_MAX_TX_PER_PASS: z.coerce.number().int().positive().default(500),
+    /** Also load history from before tracking started into the ledger (not announced). */
+    INGEST_BACKFILL: z
+        .enum(['true', 'false', '1', '0'])
+        .default('true')
+        .transform(v => v === 'true' || v === '1'),
+
     GRACE_PERIOD_SECS: z.coerce.bigint().default(3n * 24n * 3600n),
     API_HOST: z.string().default('127.0.0.1'),
     API_PORT: z.coerce.number().int().default(8787),

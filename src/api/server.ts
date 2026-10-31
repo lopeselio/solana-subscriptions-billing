@@ -84,7 +84,8 @@ export function buildServer(opts: ApiOptions): FastifyInstance {
         if (!sub) return reply.code(404).send({ error: 'not_found' });
         const plan = await repo.getPlan(sub.plan);
         const attempts = await repo.listAttempts({ subscription: address, limit: 50 });
-        return json({ ...view(sub, plan, now(), graceSecs), attempts: attempts.map(attemptView) });
+        const payments = await repo.listChainEvents({ kind: 'subscription_transfer', subscription: address, limit: 50 });
+        return json({ ...view(sub, plan, now(), graceSecs), attempts: attempts.map(attemptView), payments });
     });
 
     /** Is this wallet allowed access right now? Optionally scoped to one plan. */
@@ -111,6 +112,19 @@ export function buildServer(opts: ApiOptions): FastifyInstance {
             })
             .parse(req.query);
         return json((await repo.listAttempts(q)).map(attemptView));
+    });
+
+    /** On-chain payment ledger (every subscription transfer, by any puller), newest first. */
+    app.get('/payments', async req => {
+        const q = z
+            .object({
+                plan: wallet.optional(),
+                subscription: wallet.optional(),
+                subscriber: wallet.optional(),
+                limit: z.coerce.number().int().min(1).max(1000).optional(),
+            })
+            .parse(req.query);
+        return json(await repo.listChainEvents({ ...q, kind: 'subscription_transfer' }));
     });
 
     /** Event log, oldest first. Poll with `after` = the last id seen; same events as the webhooks. */

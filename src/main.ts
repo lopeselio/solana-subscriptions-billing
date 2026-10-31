@@ -9,6 +9,7 @@ import { loadConfig } from './config.js';
 import { connect, migrate } from './db/db.js';
 import { Repo } from './db/repo.js';
 import { refreshEntitlements } from './indexer/entitlements.js';
+import { ingestEvents } from './indexer/ingest.js';
 import { syncOnce } from './indexer/sync.js';
 import { deliverDueEvents, type WebhookConfig } from './webhooks/dispatcher.js';
 import { generateSecret } from './webhooks/signature.js';
@@ -17,7 +18,7 @@ import { runChargeCycle } from './worker/charge.js';
 const USAGE = `usage: billing <command>
 
   migrate   create/upgrade the database schema
-  sync      sync plans + subscriptions once
+  sync      sync plans + subscriptions, ingest program events, update entitlements (once)
   charge    run one charge cycle (requires KEYPAIR_PATH)
   api       serve the HTTP API
   deliver   deliver due webhook events once (requires WEBHOOK_URL)
@@ -77,6 +78,7 @@ async function main() {
         programAddress: cfg.PROGRAM_ADDRESS ? address(cfg.PROGRAM_ADDRESS) : undefined,
         signer,
         computeUnitPriceMicroLamports: cfg.COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+        ingestCommitment: cfg.INGEST_COMMITMENT,
     });
     if (signer) log.info({ signer: signer.address }, 'loaded signer');
     if (cfg.planScope === 'managed' && !signer) {
@@ -90,9 +92,20 @@ async function main() {
         maxChargesPerCycle: cfg.MAX_CHARGES_PER_CYCLE,
         dryRun: cfg.DRY_RUN,
     };
-    // Every sync is followed by an entitlement pass, so time-based changes are announced too.
+    // Snapshot, then the event ledger (new plans first get a cursor), then an entitlement pass so
+    // time-based changes are announced too.
     const sync = async () => {
         await syncOnce({ repo, chain, scope: cfg.planScope, log });
+        if (cfg.INGEST_EVENTS) {
+            await ingestEvents({
+                repo,
+                chain,
+                scope: cfg.planScope,
+                log,
+                maxTransactions: cfg.INGEST_MAX_TX_PER_PASS,
+                backfill: cfg.INGEST_BACKFILL,
+            });
+        }
         await refreshEntitlements({ repo, now: await chain.clusterTime(), graceSecs: cfg.GRACE_PERIOD_SECS, log });
     };
     const charge = () => runChargeCycle({ repo, chain, cfg: workerCfg, log });
