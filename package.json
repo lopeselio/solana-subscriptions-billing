@@ -32,6 +32,7 @@
     "start": "tsx src/main.ts",
     "billing": "tsx src/main.ts",
     "typecheck": "tsc",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "SURFPOOL_URL=${SURFPOOL_URL:-http://127.0.0.1:8899} vitest run test/e2e"
   }
 }
