@@ -49,9 +49,48 @@ export interface ChargeAttempt {
     updatedAt: Date;
 }
 
+export type EventType =
+    | 'subscription.created'
+    | 'subscription.cancelled'
+    | 'subscription.closed'
+    | 'payment.succeeded'
+    | 'payment.failed';
+
+export type DeliveryStatus = 'pending' | 'delivered' | 'failed';
+
+export interface EventRecord {
+    id: bigint;
+    eventId: string;
+    type: EventType;
+    data: Record<string, unknown>;
+    createdAt: Date;
+    deliveryStatus: DeliveryStatus;
+    deliveryAttempts: number;
+    nextDeliveryAt: Date;
+    lastError: string | null;
+    deliveredAt: Date | null;
+}
+
 type Row = Record<string, unknown>;
 const big = (v: unknown): bigint => BigInt(v as string | number | bigint);
 const date = (v: unknown): Date => (v instanceof Date ? v : new Date(v as string));
+
+// Event payloads are built in SQL so each event is inserted in the same statement as
+// the state change that caused it (an outbox without explicit transactions).
+// Token amounts and timestamps are strings, as in the HTTP API.
+const subscriptionJson = (t: string) => `jsonb_build_object(
+    'subscription', ${t}.address, 'plan', ${t}.plan, 'subscriber', ${t}.subscriber, 'payer', ${t}.payer,
+    'amount', ${t}.amount::text, 'periodHours', ${t}.period_hours::text,
+    'currentPeriodStartTs', ${t}.current_period_start_ts::text,
+    'amountPulledInPeriod', ${t}.amount_pulled_in_period::text, 'expiresAtTs', ${t}.expires_at_ts::text)`;
+
+const paymentJson = (a: string) => `jsonb_build_object(
+    'attemptId', ${a}.id::text, 'subscription', ${a}.subscription, 'plan', ${a}.plan,
+    'subscriber', s.subscriber, 'mint', p.mint, 'amount', ${a}.amount::text,
+    'periodStartTs', ${a}.period_start_ts::text, 'attemptNo', ${a}.attempt_no, 'signature', ${a}.signature)`;
+
+const paymentJoins = (a: string) =>
+    `LEFT JOIN subscriptions s ON s.address = ${a}.subscription LEFT JOIN plans p ON p.address = ${a}.plan`;
 
 function toPlan(r: Row): PlanRecord {
     return {
@@ -102,6 +141,21 @@ function toAttempt(r: Row): ChargeAttempt {
         nextRetryAt: r.next_retry_at == null ? null : date(r.next_retry_at),
         createdAt: date(r.created_at),
         updatedAt: date(r.updated_at),
+    };
+}
+
+function toEvent(r: Row): EventRecord {
+    return {
+        id: big(r.id),
+        eventId: r.event_id as string,
+        type: r.type as EventType,
+        data: (typeof r.data === 'string' ? JSON.parse(r.data) : r.data) as Record<string, unknown>,
+        createdAt: date(r.created_at),
+        deliveryStatus: r.delivery_status as DeliveryStatus,
+        deliveryAttempts: Number(r.delivery_attempts),
+        nextDeliveryAt: date(r.next_delivery_at),
+        lastError: (r.last_error as string | null) ?? null,
+        deliveredAt: r.delivered_at == null ? null : date(r.delivered_at),
     };
 }
 
@@ -164,18 +218,34 @@ export class Repo {
 
     // ---- subscriptions ----
 
+    /**
+     * Upserts a subscription snapshot. Emits `subscription.created` the first time an address is
+     * seen (or reappears after closing) and `subscription.cancelled` when `expiresAtTs` becomes set.
+     */
     async upsertSubscription(s: Omit<SubscriptionRecord, 'closed'>): Promise<void> {
         await this.db.query(
-            `INSERT INTO subscriptions (address, plan, subscriber, payer, amount, period_hours, terms_created_at,
-                                        amount_pulled_in_period, current_period_start_ts, expires_at_ts, closed, synced_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,FALSE,now())
-             ON CONFLICT (address) DO UPDATE SET
-                plan = EXCLUDED.plan, subscriber = EXCLUDED.subscriber, payer = EXCLUDED.payer,
-                amount = EXCLUDED.amount, period_hours = EXCLUDED.period_hours,
-                terms_created_at = EXCLUDED.terms_created_at,
-                amount_pulled_in_period = EXCLUDED.amount_pulled_in_period,
-                current_period_start_ts = EXCLUDED.current_period_start_ts,
-                expires_at_ts = EXCLUDED.expires_at_ts, closed = FALSE, synced_at = now()`,
+            `WITH prev AS (SELECT expires_at_ts, closed FROM subscriptions WHERE address = $1),
+             up AS (
+                INSERT INTO subscriptions (address, plan, subscriber, payer, amount, period_hours, terms_created_at,
+                                           amount_pulled_in_period, current_period_start_ts, expires_at_ts, closed, synced_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,FALSE,now())
+                ON CONFLICT (address) DO UPDATE SET
+                   plan = EXCLUDED.plan, subscriber = EXCLUDED.subscriber, payer = EXCLUDED.payer,
+                   amount = EXCLUDED.amount, period_hours = EXCLUDED.period_hours,
+                   terms_created_at = EXCLUDED.terms_created_at,
+                   amount_pulled_in_period = EXCLUDED.amount_pulled_in_period,
+                   current_period_start_ts = EXCLUDED.current_period_start_ts,
+                   expires_at_ts = EXCLUDED.expires_at_ts, closed = FALSE, synced_at = now()
+                RETURNING *)
+             INSERT INTO events (type, data)
+             SELECT ev.type, ${subscriptionJson('up')}
+             FROM up
+             LEFT JOIN prev ON TRUE
+             CROSS JOIN LATERAL (SELECT CASE
+                 WHEN prev.closed IS NULL OR prev.closed THEN 'subscription.created'
+                 WHEN prev.expires_at_ts = 0 AND up.expires_at_ts <> 0 THEN 'subscription.cancelled'
+             END AS type) ev
+             WHERE ev.type IS NOT NULL`,
             [
                 s.address,
                 s.plan,
@@ -191,12 +261,15 @@ export class Repo {
         );
     }
 
-    /** Marks a plan's tracked subscriptions that no longer exist on-chain as closed. */
+    /** Marks a plan's tracked subscriptions that no longer exist on-chain as closed; emits `subscription.closed`. */
     async markSubscriptionsClosedExcept(plan: string, existing: string[]): Promise<number> {
         const res = await this.db.query<{ address: string }>(
-            `UPDATE subscriptions SET closed = TRUE, synced_at = now()
-             WHERE plan = $1 AND closed = FALSE AND NOT (address = ANY($2::text[]))
-             RETURNING address`,
+            `WITH c AS (
+                UPDATE subscriptions SET closed = TRUE, synced_at = now()
+                WHERE plan = $1 AND closed = FALSE AND NOT (address = ANY($2::text[]))
+                RETURNING *),
+             ev AS (INSERT INTO events (type, data) SELECT 'subscription.closed', ${subscriptionJson('c')} FROM c)
+             SELECT address FROM c`,
             [plan, existing],
         );
         return res.rows.length;
@@ -258,19 +331,35 @@ export class Repo {
         ]);
     }
 
+    /** Marks an attempt succeeded and emits `payment.succeeded` (once; a repeat call is a no-op). */
     async succeedAttempt(id: bigint, signature: string): Promise<void> {
         await this.db.query(
-            `UPDATE charge_attempts SET status = 'succeeded', signature = $2, reason = NULL, error = NULL,
-                    next_retry_at = NULL, updated_at = now()
-             WHERE id = $1`,
+            `WITH a AS (
+                UPDATE charge_attempts SET status = 'succeeded', signature = $2, reason = NULL, error = NULL,
+                       next_retry_at = NULL, updated_at = now()
+                WHERE id = $1 AND status <> 'succeeded'
+                RETURNING *)
+             INSERT INTO events (type, data)
+             SELECT 'payment.succeeded', ${paymentJson('a')} FROM a ${paymentJoins('a')}`,
             [id.toString(), signature],
         );
     }
 
+    /**
+     * Marks a pending attempt failed and emits `payment.failed`. `final` in the payload is true
+     * when no retry is scheduled (terminal reason or retry schedule exhausted).
+     */
     async failAttempt(id: bigint, reason: FailureReason, error: string, nextRetryAt: Date | null): Promise<void> {
         await this.db.query(
-            `UPDATE charge_attempts SET status = 'failed', reason = $2, error = $3, next_retry_at = $4, updated_at = now()
-             WHERE id = $1`,
+            `WITH a AS (
+                UPDATE charge_attempts SET status = 'failed', reason = $2, error = $3, next_retry_at = $4, updated_at = now()
+                WHERE id = $1 AND status = 'pending'
+                RETURNING *)
+             INSERT INTO events (type, data)
+             SELECT 'payment.failed', ${paymentJson('a')} || jsonb_build_object(
+                    'reason', a.reason, 'error', a.error, 'nextRetryAt', a.next_retry_at,
+                    'final', a.next_retry_at IS NULL)
+             FROM a ${paymentJoins('a')}`,
             [id.toString(), reason, error.slice(0, 2000), nextRetryAt],
         );
     }
@@ -310,5 +399,73 @@ export class Repo {
             params,
         );
         return res.rows.map(toAttempt);
+    }
+
+    // ---- events ----
+
+    async listEvents(filter: { after?: bigint; type?: string; limit?: number } = {}): Promise<EventRecord[]> {
+        const where: string[] = [];
+        const params: unknown[] = [];
+        if (filter.after !== undefined) {
+            params.push(filter.after.toString());
+            where.push(`id > $${params.length}`);
+        }
+        if (filter.type) {
+            params.push(filter.type);
+            where.push(`type = $${params.length}`);
+        }
+        params.push(Math.min(filter.limit ?? 100, 1000));
+        const res = await this.db.query(
+            `SELECT * FROM events ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+             ORDER BY id LIMIT $${params.length}`,
+            params,
+        );
+        return res.rows.map(toEvent);
+    }
+
+    /**
+     * Claims up to `limit` due events for delivery. Each claimed event is leased for `leaseSecs`
+     * (its next_delivery_at is pushed out) so concurrent dispatchers don't send it twice.
+     */
+    async claimDueEvents(limit: number, leaseSecs: number): Promise<EventRecord[]> {
+        const res = await this.db.query(
+            `UPDATE events SET next_delivery_at = now() + make_interval(secs => $2),
+                               delivery_attempts = delivery_attempts + 1
+             WHERE id IN (SELECT id FROM events
+                          WHERE delivery_status = 'pending' AND next_delivery_at <= now()
+                          ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED)
+             RETURNING *`,
+            [limit, leaseSecs],
+        );
+        return res.rows.map(toEvent).sort((a, b) => (a.id < b.id ? -1 : 1));
+    }
+
+    async markEventDelivered(id: bigint): Promise<void> {
+        await this.db.query(
+            `UPDATE events SET delivery_status = 'delivered', delivered_at = now(), last_error = NULL WHERE id = $1`,
+            [id.toString()],
+        );
+    }
+
+    /** Records a failed delivery; `nextAt` null means retries are exhausted. */
+    async markEventDeliveryFailed(id: bigint, error: string, nextAt: Date | null): Promise<void> {
+        await this.db.query(
+            `UPDATE events SET last_error = $2,
+                    delivery_status = CASE WHEN $3::timestamptz IS NULL THEN 'failed' ELSE 'pending' END,
+                    next_delivery_at = COALESCE($3::timestamptz, next_delivery_at)
+             WHERE id = $1`,
+            [id.toString(), error.slice(0, 2000), nextAt],
+        );
+    }
+
+    /** Queues an event for delivery again with a fresh retry budget. Returns false if unknown. */
+    async redeliverEvent(eventId: string): Promise<boolean> {
+        const res = await this.db.query(
+            `UPDATE events SET delivery_status = 'pending', delivery_attempts = 0, next_delivery_at = now(),
+                               last_error = NULL, delivered_at = NULL
+             WHERE event_id = $1 RETURNING id`,
+            [eventId],
+        );
+        return res.rows.length > 0;
     }
 }

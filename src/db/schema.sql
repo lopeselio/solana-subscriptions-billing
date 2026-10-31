@@ -65,3 +65,23 @@ CREATE TABLE IF NOT EXISTS sync_state (
     value      TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Outbox of billing events, written in the same statement as the state change
+-- that caused them. Delivered to WEBHOOK_URL (if set) and readable via GET /events.
+CREATE TABLE IF NOT EXISTS events (
+    id                BIGSERIAL PRIMARY KEY,
+    event_id          TEXT        NOT NULL UNIQUE
+                      DEFAULT ('evt_' || replace(gen_random_uuid()::text, '-', '')),
+    type              TEXT        NOT NULL,
+    data              JSONB       NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- delivery: pending -> delivered | failed (retries exhausted)
+    delivery_status   TEXT        NOT NULL DEFAULT 'pending'
+                      CHECK (delivery_status IN ('pending', 'delivered', 'failed')),
+    delivery_attempts INTEGER     NOT NULL DEFAULT 0,
+    next_delivery_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_error        TEXT,
+    delivered_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS events_due_idx ON events (next_delivery_at) WHERE delivery_status = 'pending';
+CREATE INDEX IF NOT EXISTS events_type_idx ON events (type, id);
