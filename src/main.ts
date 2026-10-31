@@ -8,6 +8,7 @@ import { loadKeypairFile, SolanaChain } from './chain/solana.js';
 import { loadConfig } from './config.js';
 import { connect, migrate } from './db/db.js';
 import { Repo } from './db/repo.js';
+import { refreshEntitlements } from './indexer/entitlements.js';
 import { syncOnce } from './indexer/sync.js';
 import { deliverDueEvents, type WebhookConfig } from './webhooks/dispatcher.js';
 import { generateSecret } from './webhooks/signature.js';
@@ -89,7 +90,11 @@ async function main() {
         maxChargesPerCycle: cfg.MAX_CHARGES_PER_CYCLE,
         dryRun: cfg.DRY_RUN,
     };
-    const sync = () => syncOnce({ repo, chain, scope: cfg.planScope, log });
+    // Every sync is followed by an entitlement pass, so time-based changes are announced too.
+    const sync = async () => {
+        await syncOnce({ repo, chain, scope: cfg.planScope, log });
+        await refreshEntitlements({ repo, now: await chain.clusterTime(), graceSecs: cfg.GRACE_PERIOD_SECS, log });
+    };
     const charge = () => runChargeCycle({ repo, chain, cfg: workerCfg, log });
 
     if (cmd === 'sync') {
