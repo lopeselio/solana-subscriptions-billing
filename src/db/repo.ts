@@ -89,7 +89,8 @@ const subscriptionJson = (t: string) => `jsonb_build_object(
 const paymentJson = (a: string) => `jsonb_build_object(
     'attemptId', ${a}.id::text, 'subscription', ${a}.subscription, 'plan', ${a}.plan,
     'subscriber', s.subscriber, 'mint', p.mint, 'amount', ${a}.amount::text,
-    'periodStartTs', ${a}.period_start_ts::text, 'attemptNo', ${a}.attempt_no, 'signature', ${a}.signature)`;
+    'periodStartTs', ${a}.period_start_ts::text, 'attemptNo', ${a}.attempt_no, 'signature', ${a}.signature,
+    'source', 'worker')`;
 
 const paymentJoins = (a: string) =>
     `LEFT JOIN subscriptions s ON s.address = ${a}.subscription LEFT JOIN plans p ON p.address = ${a}.plan`;
@@ -143,6 +144,33 @@ function toAttempt(r: Row): ChargeAttempt {
         nextRetryAt: r.next_retry_at == null ? null : date(r.next_retry_at),
         createdAt: date(r.created_at),
         updatedAt: date(r.updated_at),
+    };
+}
+
+export interface ChainEventRecord {
+    signature: string;
+    eventIndex: number;
+    slot: bigint;
+    blockTime: bigint | null;
+    kind: string;
+    plan: string;
+    subscription: string | null;
+    subscriber: string | null;
+    /** Decoded event fields; u64/i64 as strings. */
+    data: Record<string, unknown>;
+}
+
+function toChainEvent(r: Row): ChainEventRecord {
+    return {
+        signature: r.signature as string,
+        eventIndex: Number(r.event_index),
+        slot: big(r.slot),
+        blockTime: r.block_time == null ? null : big(r.block_time),
+        kind: r.kind as string,
+        plan: r.plan as string,
+        subscription: (r.subscription as string | null) ?? null,
+        subscriber: (r.subscriber as string | null) ?? null,
+        data: (typeof r.data === 'string' ? JSON.parse(r.data) : r.data) as Record<string, unknown>,
     };
 }
 
@@ -515,5 +543,76 @@ export class Repo {
             [eventId],
         );
         return res.rows.length > 0;
+    }
+
+    // ---- chain event ledger ----
+
+    /**
+     * Stores one ingested program event (idempotent on signature + index). A subscription
+     * transfer not made by this worker (no charge attempt with that signature) also emits
+     * `payment.succeeded` with `source: 'chain'`, in the same statement. Returns whether it was new.
+     */
+    async insertChainEvent(e: ChainEventRecord, payment: Record<string, unknown> | null): Promise<boolean> {
+        const res = await this.db.query<{ inserted: number }>(
+            `WITH ins AS (
+                INSERT INTO chain_events (signature, event_index, slot, block_time, kind, plan, subscription, subscriber, data)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+                ON CONFLICT DO NOTHING
+                RETURNING signature),
+             ev AS (
+                INSERT INTO events (type, data)
+                SELECT 'payment.succeeded', $10::jsonb FROM ins
+                WHERE $10::jsonb IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM charge_attempts a WHERE a.signature = ins.signature))
+             SELECT count(*)::int AS inserted FROM ins`,
+            [
+                e.signature,
+                e.eventIndex,
+                e.slot.toString(),
+                e.blockTime?.toString() ?? null,
+                e.kind,
+                e.plan,
+                e.subscription,
+                e.subscriber,
+                JSON.stringify(e.data),
+                payment === null ? null : JSON.stringify(payment),
+            ],
+        );
+        return res.rows[0]!.inserted > 0;
+    }
+
+    async listChainEvents(
+        filter: { kind?: string; plan?: string; subscription?: string; subscriber?: string; limit?: number } = {},
+    ): Promise<ChainEventRecord[]> {
+        const where: string[] = [];
+        const params: unknown[] = [];
+        for (const col of ['kind', 'plan', 'subscription', 'subscriber'] as const) {
+            if (filter[col]) {
+                params.push(filter[col]);
+                where.push(`${col} = $${params.length}`);
+            }
+        }
+        params.push(Math.min(filter.limit ?? 100, 1000));
+        const res = await this.db.query(
+            `SELECT * FROM chain_events ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+             ORDER BY slot DESC, signature, event_index DESC LIMIT $${params.length}`,
+            params,
+        );
+        return res.rows.map(toChainEvent);
+    }
+
+    // ---- sync state ----
+
+    async getState(key: string): Promise<string | null> {
+        const res = await this.db.query<{ value: string }>(`SELECT value FROM sync_state WHERE key = $1`, [key]);
+        return res.rows[0]?.value ?? null;
+    }
+
+    async setState(key: string, value: string): Promise<void> {
+        await this.db.query(
+            `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, now())
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+            [key, value],
+        );
     }
 }

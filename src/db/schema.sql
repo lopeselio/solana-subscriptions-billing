@@ -88,3 +88,22 @@ CREATE INDEX IF NOT EXISTS events_type_idx ON events (type, id);
 
 -- Last entitlement status announced via `entitlement.changed` (NULL = never evaluated).
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS entitlement_status TEXT;
+
+-- Ledger of the program's own events (self-CPI), ingested from transaction history.
+-- Covers pulls by any puller, not only this worker. Fields mirror program/src/events/*.rs.
+CREATE TABLE IF NOT EXISTS chain_events (
+    signature    TEXT        NOT NULL,
+    event_index  INTEGER     NOT NULL,
+    slot         BIGINT      NOT NULL,
+    block_time   BIGINT,
+    kind         TEXT        NOT NULL,
+    plan         TEXT        NOT NULL,
+    subscription TEXT,
+    subscriber   TEXT,
+    data         JSONB       NOT NULL,
+    ingested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (signature, event_index)
+);
+CREATE INDEX IF NOT EXISTS chain_events_subscription_idx ON chain_events (subscription, slot);
+CREATE INDEX IF NOT EXISTS chain_events_plan_idx ON chain_events (plan, slot);
+CREATE INDEX IF NOT EXISTS chain_events_kind_idx ON chain_events (kind, slot);
