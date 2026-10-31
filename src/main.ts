@@ -9,6 +9,8 @@ import { loadConfig } from './config.js';
 import { connect, migrate } from './db/db.js';
 import { Repo } from './db/repo.js';
 import { syncOnce } from './indexer/sync.js';
+import { deliverDueEvents, type WebhookConfig } from './webhooks/dispatcher.js';
+import { generateSecret } from './webhooks/signature.js';
 import { runChargeCycle } from './worker/charge.js';
 
 const USAGE = `usage: billing <command>
@@ -17,14 +19,22 @@ const USAGE = `usage: billing <command>
   sync      sync plans + subscriptions once
   charge    run one charge cycle (requires KEYPAIR_PATH)
   api       serve the HTTP API
-  run       sync + charge loops + API (charging only when KEYPAIR_PATH is set)
+  deliver   deliver due webhook events once (requires WEBHOOK_URL)
+  run       sync + charge loops + webhook delivery + API
+            (charging only with KEYPAIR_PATH, delivery only with WEBHOOK_URL)
+  webhook-secret  print a new whsec_ signing secret
 `;
+const COMMANDS = ['migrate', 'sync', 'charge', 'api', 'deliver', 'run', 'webhook-secret'];
 
 async function main() {
     const cmd = process.argv[2];
-    if (!cmd || !['migrate', 'sync', 'charge', 'api', 'run'].includes(cmd)) {
+    if (!cmd || !COMMANDS.includes(cmd)) {
         process.stderr.write(USAGE);
         process.exit(cmd ? 1 : 0);
+    }
+    if (cmd === 'webhook-secret') {
+        process.stdout.write(generateSecret() + '\n');
+        return;
     }
 
     const cfg = loadConfig();
@@ -36,6 +46,26 @@ async function main() {
     const repo = new Repo(db);
     if (cmd === 'migrate') {
         log.info('schema up to date');
+        return db.close();
+    }
+
+    const webhookCfg: WebhookConfig | null = cfg.WEBHOOK_URL
+        ? {
+              url: cfg.WEBHOOK_URL,
+              secrets: cfg.WEBHOOK_SECRET!,
+              timeoutMs: cfg.WEBHOOK_TIMEOUT_MS,
+              retryScheduleSecs: cfg.WEBHOOK_RETRY_SCHEDULE_SECS,
+              batchSize: 20,
+          }
+        : null;
+    const deliver = async () => {
+        if (!webhookCfg) return;
+        const res = await deliverDueEvents({ repo, cfg: webhookCfg, log });
+        if (res.delivered || res.failed) log.info(res, 'webhook delivery pass');
+    };
+    if (cmd === 'deliver') {
+        if (!webhookCfg) throw new Error('deliver requires WEBHOOK_URL');
+        await deliver();
         return db.close();
     }
 
@@ -95,7 +125,19 @@ async function main() {
             await new Promise(r => setTimeout(r, cfg.SYNC_INTERVAL_SECS * 1000));
         }
     };
-    const done = loop();
+    // Webhooks get their own, shorter loop so delivery latency doesn't depend on sync time.
+    const deliveryLoop = async () => {
+        while (!stopping && webhookCfg) {
+            try {
+                await deliver();
+            } catch (err) {
+                log.error({ err }, 'webhook delivery pass failed');
+            }
+            await new Promise(r => setTimeout(r, cfg.WEBHOOK_INTERVAL_SECS * 1000));
+        }
+    };
+    if (webhookCfg) log.info({ url: webhookCfg.url }, 'webhook delivery enabled');
+    const done = Promise.all([loop(), deliveryLoop()]);
     const shutdown = async () => {
         stopping = true;
         log.info('shutting down');

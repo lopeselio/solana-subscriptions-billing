@@ -113,6 +113,25 @@ export function buildServer(opts: ApiOptions): FastifyInstance {
         return json((await repo.listAttempts(q)).map(attemptView));
     });
 
+    /** Event log, oldest first. Poll with `after` = the last id seen; same events as the webhooks. */
+    app.get('/events', async req => {
+        const q = z
+            .object({
+                after: z.coerce.bigint().min(0n).optional(),
+                type: z.string().max(64).optional(),
+                limit: z.coerce.number().int().min(1).max(1000).optional(),
+            })
+            .parse(req.query);
+        return json(await repo.listEvents(q));
+    });
+
+    /** Re-queue an event for webhook delivery (e.g. after fixing a receiver), with a fresh retry budget. */
+    app.post('/events/:eventId/redeliver', async (req, reply) => {
+        const { eventId } = z.object({ eventId: z.string().regex(/^evt_[0-9a-f]{32}$/) }).parse(req.params);
+        if (!(await repo.redeliverEvent(eventId))) return reply.code(404).send({ error: 'not_found' });
+        return reply.code(202).send({ eventId, deliveryStatus: 'pending' });
+    });
+
     app.setErrorHandler((err, _req, reply) => {
         if (err instanceof z.ZodError) return reply.code(400).send({ error: 'bad_request', issues: err.issues });
         return reply.code(500).send({ error: 'internal' });
