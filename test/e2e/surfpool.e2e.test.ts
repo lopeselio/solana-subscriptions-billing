@@ -4,6 +4,9 @@
  *   surfpool start --ci --no-tui --no-deploy --network mainnet
  *   SURFPOOL_URL=http://127.0.0.1:8899 pnpm test:e2e
  */
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+
 import { findAssociatedTokenPda, TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
 import {
     type Address,
@@ -35,12 +38,15 @@ import {
     getSubscribeOverlayInstructionAsync,
 } from '@solana/subscriptions';
 import pino from 'pino';
+import { Webhook } from 'standardwebhooks';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { SolanaChain } from '../../src/chain/solana.js';
 import { connectPglite, type Db, migrate } from '../../src/db/db.js';
 import { Repo } from '../../src/db/repo.js';
 import { syncOnce } from '../../src/indexer/sync.js';
+import { deliverDueEvents } from '../../src/webhooks/dispatcher.js';
+import { generateSecret } from '../../src/webhooks/signature.js';
 import { runChargeCycle, type WorkerConfig } from '../../src/worker/charge.js';
 
 const URL = process.env.SURFPOOL_URL;
@@ -220,6 +226,17 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         expect(aliceAttempt?.status).toBe('succeeded');
         expect(aliceAttempt?.signature).toBeTruthy();
 
+        const [paid] = await repo.listEvents({ type: 'payment.succeeded' });
+        expect(paid?.data).toMatchObject({
+            subscription: aliceSub,
+            subscriber: alice.address,
+            mint: USDC,
+            amount: PRICE.toString(),
+            signature: aliceAttempt?.signature,
+        });
+        const [failed] = await repo.listEvents({ type: 'payment.failed' });
+        expect(failed?.data).toMatchObject({ subscription: bobSub, reason: 'insufficient_funds', final: false });
+
         // On-chain state agrees after re-sync.
         await syncOnce({ repo, chain, scope: 'managed', log });
         expect((await repo.getSubscription(aliceSub))?.amountPulledInPeriod).toBe(PRICE);
@@ -243,9 +260,46 @@ describe.skipIf(!URL)('e2e on Surfpool', () => {
         await syncOnce({ repo, chain, scope: 'managed', log });
         expect((await repo.getSubscription(aliceSub))?.expiresAtTs).not.toBe(0n);
 
+        const [cancelled] = await repo.listEvents({ type: 'subscription.cancelled' });
+        expect(cancelled?.data).toMatchObject({ subscription: aliceSub });
+
         await timeTravelSecs(PERIOD_HOURS * 3600n + 60n);
         const res = await cycle();
         expect(res.charged).toBe(0);
         expect(await usdcBalance(merchant.address)).toBe(2n * PRICE);
     }, 120_000);
+
+    it('delivers every recorded event as a verifiable webhook', async () => {
+        const secret = generateSecret();
+        const received: unknown[] = [];
+        const server = createServer((req, res) => {
+            let body = '';
+            req.on('data', c => (body += c));
+            req.on('end', () => {
+                received.push(new Webhook(secret).verify(body, req.headers as Record<string, string>));
+                res.writeHead(204).end();
+            });
+        });
+        await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+        try {
+            const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+            const cfg = { url, secrets: [secret], timeoutMs: 5000, retryScheduleSecs: [60], batchSize: 20 };
+            const res = await deliverDueEvents({ repo, cfg, log });
+            expect(res.failed).toBe(0);
+            const recorded = await repo.listEvents();
+            const got = received as { id: string; type: string }[];
+            expect(got.map(e => e.id)).toEqual(recorded.map(e => e.eventId));
+            expect(new Set(got.map(e => e.type))).toEqual(
+                new Set([
+                    'subscription.created',
+                    'subscription.cancelled',
+                    'payment.succeeded',
+                    'payment.failed',
+                ]),
+            );
+            expect(got.filter(e => e.type === 'payment.succeeded')).toHaveLength(2);
+        } finally {
+            await new Promise(r => server.close(r));
+        }
+    }, 60_000);
 });
