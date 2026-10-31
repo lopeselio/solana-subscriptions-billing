@@ -1,0 +1,52 @@
+import { z } from 'zod';
+
+const csvNumbers = z
+    .string()
+    .transform(s => s.split(',').map(x => Number(x.trim())))
+    .pipe(z.array(z.number().int().positive()));
+
+const schema = z.object({
+    DATABASE_URL: z.string().default('pglite:./.data/pglite'),
+    RPC_URL: z.string().url().default('https://api.devnet.solana.com'),
+    /** Defaults to RPC_URL with http(s) -> ws(s). */
+    RPC_WS_URL: z.string().url().optional(),
+    /** Override for local deployments; defaults to the canonical program ID. */
+    PROGRAM_ADDRESS: z.string().optional(),
+
+    /** Solana CLI keypair JSON for the merchant or an approved puller. Omit for read-only (indexer + API). */
+    KEYPAIR_PATH: z.string().optional(),
+    /** 'managed' | 'all' | comma-separated plan addresses. */
+    PLAN_SCOPE: z.string().default('managed'),
+    DESTINATION_OWNER: z.string().optional(),
+
+    SYNC_INTERVAL_SECS: z.coerce.number().int().positive().default(30),
+    CHARGE_INTERVAL_SECS: z.coerce.number().int().positive().default(60),
+    RETRY_SCHEDULE_SECS: csvNumbers.default([3600, 6 * 3600, 24 * 3600, 72 * 3600]),
+    PENDING_TIMEOUT_SECS: z.coerce.number().int().positive().default(180),
+    MAX_CHARGES_PER_CYCLE: z.coerce.number().int().positive().default(200),
+    COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: z.coerce.bigint().default(0n),
+    DRY_RUN: z
+        .enum(['true', 'false', '1', '0'])
+        .default('false')
+        .transform(v => v === 'true' || v === '1'),
+
+    GRACE_PERIOD_SECS: z.coerce.bigint().default(3n * 24n * 3600n),
+    API_HOST: z.string().default('127.0.0.1'),
+    API_PORT: z.coerce.number().int().default(8787),
+    API_KEY: z.string().min(16).optional(),
+    LOG_LEVEL: z.string().default('info'),
+});
+
+export type Config = z.infer<typeof schema> & { RPC_WS_URL: string; planScope: 'managed' | 'all' | string[] };
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+    const c = schema.parse(env);
+    const scope = c.PLAN_SCOPE === 'managed' || c.PLAN_SCOPE === 'all'
+        ? c.PLAN_SCOPE
+        : c.PLAN_SCOPE.split(',').map(s => s.trim()).filter(Boolean);
+    return {
+        ...c,
+        RPC_WS_URL: c.RPC_WS_URL ?? c.RPC_URL.replace(/^http/, 'ws'),
+        planScope: scope,
+    };
+}
