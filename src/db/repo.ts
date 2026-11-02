@@ -1,4 +1,5 @@
 import type { FailureReason } from '../core/billing.js';
+import type { PlanMetadata } from '../metadata/schema.js';
 import type { Db } from './db.js';
 
 export interface PlanRecord {
@@ -16,6 +17,23 @@ export interface PlanRecord {
     metadataUri: string;
     closed: boolean;
 }
+
+export type MetadataStatus = 'none' | 'ok' | 'invalid' | 'unreachable' | 'opaque' | 'skipped';
+
+/** A plan's metadata as resolved from its `metadataUri`. */
+export interface PlanMetadataState {
+    /** null until the first resolution pass after the plan is seen. */
+    status: MetadataStatus | null;
+    /** Where the document came from: inline JSON in the URI, or a fetched URL. */
+    source: 'inline' | 'url' | null;
+    /** The last good document for the current URI (kept if a later refresh fails). */
+    data: PlanMetadata | null;
+    /** Why the status isn't ok, the last refresh error, or ignored-field warnings. */
+    error: string | null;
+    checkedAt: Date | null;
+}
+
+export type StoredPlan = PlanRecord & { metadata: PlanMetadataState };
 
 export interface SubscriptionRecord {
     address: string;
@@ -110,6 +128,20 @@ function toPlan(r: Row): PlanRecord {
         pullers: r.pullers as string[],
         metadataUri: r.metadata_uri as string,
         closed: r.closed as boolean,
+    };
+}
+
+function toStoredPlan(r: Row): StoredPlan {
+    const data = r.metadata == null ? null : typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata;
+    return {
+        ...toPlan(r),
+        metadata: {
+            status: (r.metadata_status as MetadataStatus | null) ?? null,
+            source: (r.metadata_source as 'inline' | 'url' | null) ?? null,
+            data: data as PlanMetadata | null,
+            error: (r.metadata_error as string | null) ?? null,
+            checkedAt: r.metadata_checked_at == null ? null : date(r.metadata_checked_at),
+        },
     };
 }
 
@@ -234,16 +266,65 @@ export class Repo {
         return res.rows.length;
     }
 
-    async listPlans(opts: { includeClosed?: boolean } = {}): Promise<PlanRecord[]> {
+    async listPlans(opts: { includeClosed?: boolean } = {}): Promise<StoredPlan[]> {
         const res = await this.db.query(
             `SELECT * FROM plans ${opts.includeClosed ? '' : 'WHERE closed = FALSE'} ORDER BY first_seen_at`,
         );
-        return res.rows.map(toPlan);
+        return res.rows.map(toStoredPlan);
     }
 
-    async getPlan(address: string): Promise<PlanRecord | null> {
+    async getPlan(address: string): Promise<StoredPlan | null> {
         const res = await this.db.query(`SELECT * FROM plans WHERE address = $1`, [address]);
-        return res.rows[0] ? toPlan(res.rows[0]) : null;
+        return res.rows[0] ? toStoredPlan(res.rows[0]) : null;
+    }
+
+    /**
+     * Live plans whose metadata needs resolving: never resolved for the current URI, unreachable
+     * for longer than `retrySecs`, or fetched from a URL longer than `refreshSecs` ago (0 = never
+     * refresh). Changed URIs first.
+     */
+    async listPlansForMetadata(
+        refreshSecs: number,
+        retrySecs: number,
+    ): Promise<{ address: string; metadataUri: string; stale: boolean }[]> {
+        const res = await this.db.query<{ address: string; metadata_uri: string; stale: boolean }>(
+            `SELECT address, metadata_uri, (metadata_resolved_uri IS DISTINCT FROM metadata_uri) AS stale
+             FROM plans
+             WHERE closed = FALSE AND (
+                metadata_resolved_uri IS DISTINCT FROM metadata_uri
+                OR (metadata_status = 'unreachable' AND metadata_checked_at < now() - make_interval(secs => $2))
+                OR ($1 > 0 AND metadata_source = 'url' AND metadata_status IN ('ok', 'invalid')
+                    AND metadata_checked_at < now() - make_interval(secs => $1)))
+             ORDER BY stale DESC, metadata_checked_at NULLS FIRST, address`,
+            [refreshSecs, retrySecs],
+        );
+        return res.rows.map(r => ({ address: r.address, metadataUri: r.metadata_uri, stale: r.stale }));
+    }
+
+    /**
+     * Records a resolution of `uri`. Ignored if the plan's URI has changed since (the next pass
+     * resolves the new one). A failed refresh of a URI that resolved before keeps the last good
+     * document and status, recording only the error.
+     */
+    async setPlanMetadata(
+        address: string,
+        uri: string,
+        r: { status: MetadataStatus; source: 'inline' | 'url' | null; data: PlanMetadata | null; error: string | null },
+    ): Promise<void> {
+        await this.db.query(
+            `UPDATE plans SET
+                metadata_status = CASE WHEN keep THEN metadata_status ELSE $3 END,
+                metadata_source = $4,
+                metadata = CASE WHEN keep THEN metadata ELSE $5::jsonb END,
+                metadata_error = $6,
+                metadata_resolved_uri = $2,
+                metadata_checked_at = now()
+             FROM (SELECT $3 = 'unreachable' AND metadata_resolved_uri IS NOT DISTINCT FROM $2
+                          AND metadata_status = 'ok' AS keep
+                   FROM plans WHERE address = $1) prev
+             WHERE address = $1 AND metadata_uri = $2`,
+            [address, uri, r.status, r.source, r.data === null ? null : JSON.stringify(r.data), r.error],
+        );
     }
 
     // ---- subscriptions ----

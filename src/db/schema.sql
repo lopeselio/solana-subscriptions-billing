@@ -107,3 +107,13 @@ CREATE TABLE IF NOT EXISTS chain_events (
 CREATE INDEX IF NOT EXISTS chain_events_subscription_idx ON chain_events (subscription, slot);
 CREATE INDEX IF NOT EXISTS chain_events_plan_idx ON chain_events (plan, slot);
 CREATE INDEX IF NOT EXISTS chain_events_kind_idx ON chain_events (kind, slot);
+
+-- Plan metadata resolved from metadata_uri (schemas/plan-metadata.v1.json).
+-- status: none | ok | invalid | unreachable | opaque | skipped. metadata_resolved_uri is the
+-- metadata_uri value the row was resolved for, so an on-chain change triggers re-resolution.
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS metadata JSONB;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS metadata_status TEXT;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS metadata_source TEXT;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS metadata_error TEXT;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS metadata_resolved_uri TEXT;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS metadata_checked_at TIMESTAMPTZ;

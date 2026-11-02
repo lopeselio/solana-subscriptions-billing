@@ -11,6 +11,8 @@ import { Repo } from './db/repo.js';
 import { refreshEntitlements } from './indexer/entitlements.js';
 import { ingestEvents } from './indexer/ingest.js';
 import { syncOnce } from './indexer/sync.js';
+import { fetchMetadataDocument, type FetchOptions } from './metadata/fetch.js';
+import { resolvePlanMetadata } from './metadata/resolve.js';
 import { deliverDueEvents, type WebhookConfig } from './webhooks/dispatcher.js';
 import { generateSecret } from './webhooks/signature.js';
 import { runChargeCycle } from './worker/charge.js';
@@ -18,7 +20,8 @@ import { runChargeCycle } from './worker/charge.js';
 const USAGE = `usage: billing <command>
 
   migrate   create/upgrade the database schema
-  sync      sync plans + subscriptions, ingest program events, update entitlements (once)
+  sync      sync plans + subscriptions, ingest program events, update entitlements,
+            resolve plan metadata (once)
   charge    run one charge cycle (requires KEYPAIR_PATH)
   api       serve the HTTP API
   deliver   deliver due webhook events once (requires WEBHOOK_URL)
@@ -41,6 +44,11 @@ async function main() {
 
     const cfg = loadConfig();
     const log = pino({ level: cfg.LOG_LEVEL });
+    const fetchOpts: FetchOptions = {
+        timeoutMs: cfg.METADATA_TIMEOUT_MS,
+        maxBytes: cfg.METADATA_MAX_BYTES,
+        allowLocal: cfg.METADATA_ALLOW_LOCAL,
+    };
 
     if (cfg.DATABASE_URL.startsWith('pglite:./')) await mkdir('.data', { recursive: true });
     const db = await connect(cfg.DATABASE_URL);
@@ -108,6 +116,17 @@ async function main() {
             });
         }
         await refreshEntitlements({ repo, now: await chain.clusterTime(), graceSecs: cfg.GRACE_PERIOD_SECS, log });
+        await resolvePlanMetadata({
+            repo,
+            cfg: {
+                fetch: cfg.METADATA_FETCH,
+                refreshSecs: cfg.METADATA_REFRESH_SECS,
+                retrySecs: cfg.METADATA_RETRY_SECS,
+                maxFetchesPerPass: cfg.METADATA_MAX_FETCHES_PER_PASS,
+            },
+            fetchDocument: url => fetchMetadataDocument(url, fetchOpts),
+            log,
+        });
     };
     const charge = () => runChargeCycle({ repo, chain, cfg: workerCfg, log });
 

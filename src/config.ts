@@ -48,6 +48,23 @@ const schema = z.object({
         .default('true')
         .transform(v => v === 'true' || v === '1'),
 
+    /** Fetch plan metadata from https URLs in metadataUri (inline JSON is always read). */
+    METADATA_FETCH: z
+        .enum(['true', 'false', '1', '0'])
+        .default('true')
+        .transform(v => v === 'true' || v === '1'),
+    /** Re-fetch URL metadata this often; 0 = only when the on-chain URI changes. */
+    METADATA_REFRESH_SECS: z.coerce.number().int().min(0).default(24 * 3600),
+    METADATA_RETRY_SECS: z.coerce.number().int().positive().default(900),
+    METADATA_MAX_FETCHES_PER_PASS: z.coerce.number().int().positive().default(20),
+    METADATA_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+    METADATA_MAX_BYTES: z.coerce.number().int().positive().default(64 * 1024),
+    /** Development only: also fetch http:// and private/loopback addresses. */
+    METADATA_ALLOW_LOCAL: z
+        .enum(['true', 'false', '1', '0'])
+        .default('false')
+        .transform(v => v === 'true' || v === '1'),
+
     GRACE_PERIOD_SECS: z.coerce.bigint().default(3n * 24n * 3600n),
     API_HOST: z.string().default('127.0.0.1'),
     API_PORT: z.coerce.number().int().default(8787),
