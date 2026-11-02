@@ -11,6 +11,7 @@ import { Repo } from './db/repo.js';
 import { refreshEntitlements } from './indexer/entitlements.js';
 import { ingestEvents } from './indexer/ingest.js';
 import { syncOnce } from './indexer/sync.js';
+import { checkMetadata } from './metadata/check.js';
 import { fetchMetadataDocument, type FetchOptions } from './metadata/fetch.js';
 import { resolvePlanMetadata } from './metadata/resolve.js';
 import { deliverDueEvents, type WebhookConfig } from './webhooks/dispatcher.js';
@@ -28,8 +29,10 @@ const USAGE = `usage: billing <command>
   run       sync + charge loops + webhook delivery + API
             (charging only with KEYPAIR_PATH, delivery only with WEBHOOK_URL)
   webhook-secret  print a new whsec_ signing secret
+  metadata-check <file | url | inline JSON>
+            validate plan metadata against schemas/plan-metadata.v1.json
 `;
-const COMMANDS = ['migrate', 'sync', 'charge', 'api', 'deliver', 'run', 'webhook-secret'];
+const COMMANDS = ['migrate', 'sync', 'charge', 'api', 'deliver', 'run', 'webhook-secret', 'metadata-check'];
 
 async function main() {
     const cmd = process.argv[2];
@@ -49,6 +52,15 @@ async function main() {
         maxBytes: cfg.METADATA_MAX_BYTES,
         allowLocal: cfg.METADATA_ALLOW_LOCAL,
     };
+
+    if (cmd === 'metadata-check') {
+        const input = process.argv[3];
+        if (!input) throw new Error('usage: billing metadata-check <file | url | inline JSON>');
+        const report = await checkMetadata(input, fetchOpts);
+        process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+        process.exitCode = report.ok ? 0 : 1;
+        return;
+    }
 
     if (cfg.DATABASE_URL.startsWith('pglite:./')) await mkdir('.data', { recursive: true });
     const db = await connect(cfg.DATABASE_URL);
