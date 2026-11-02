@@ -176,6 +176,69 @@ program signed by that PDA, which nothing else can produce.
 `GET /payments?plan=&subscription=&subscriber=&limit=` returns the ledger newest first, and
 `GET /subscriptions/:address` includes it as `payments`.
 
+## Plan metadata
+
+A plan's on-chain `metadataUri` is 128 bytes of free text. [`schemas/plan-metadata.v1.json`](schemas/plan-metadata.v1.json)
+defines what goes in it, in one of two forms:
+
+- **A hosted document.** Put an https URL in `metadataUri` that serves:
+
+  ```json
+  {
+    "$schema": "https://raw.githubusercontent.com/lopeselio/solana-subscriptions-billing/main/schemas/plan-metadata.v1.json",
+    "name": "Pro",
+    "description": "Unlimited API calls and priority support.",
+    "image": "https://example.com/pro.png",
+    "external_url": "https://example.com/pricing#pro",
+    "terms_url": "https://example.com/terms",
+    "support_url": "https://example.com/help",
+    "features": ["Unlimited API calls", "Priority support"],
+    "attributes": { "stripe_price": "price_123" }
+  }
+  ```
+
+  Only `name` is required. Field names follow the Metaplex token metadata convention, which the
+  hosted plan documents on mainnet already use.
+- **Compact inline JSON**, stored in `metadataUri` itself, as the reference webapp does:
+  `{"n":"Pro","d":"Unlimited API calls","i":"Star","w":"https://example.com"}` (`n` name,
+  `d` description, `i` icon, `w` website; any other key is an attribute).
+
+Price, token, period, destinations and pullers are deliberately not in the schema. They are
+authoritative on-chain, and a price restated in metadata can disagree with what is actually
+charged. Show them from the plan account.
+
+Each sync resolves metadata for new or changed URIs and serves it on `GET /plans` and
+`GET /plans/:address` as `metadata: { status, source, data, error, checkedAt }`:
+
+| status        | meaning                                                                   |
+| ------------- | ------------------------------------------------------------------------- |
+| `ok`          | `data` holds the normalized document (camelCase: `externalUrl`, ...)     |
+| `none`        | `metadataUri` is empty                                                    |
+| `opaque`      | an app-specific tag, not a URL or JSON (e.g. `vendor:plan:monthly`)       |
+| `invalid`     | not a metadata document: no name, not JSON, HTML, 4xx, over 64 KiB        |
+| `unreachable` | network error, timeout or 5xx; retried after `METADATA_RETRY_SECS`       |
+| `skipped`     | never fetched: not https, or a private address, or fetching is disabled   |
+
+Readers are lenient: a document with a valid name is accepted, and an optional field that fails
+validation is dropped and listed in `error`. URL documents are re-checked every
+`METADATA_REFRESH_SECS` (default a day); if a refresh fails, the last good document is kept.
+
+Anyone can create a plan, so `metadataUri` is untrusted. Only https URLs are fetched, and every
+address a hostname resolves to must be public, checked inside the connection's own DNS lookup so
+a rebinding DNS server can't swap in a private one afterwards. Redirects are re-checked; responses
+are capped at `METADATA_MAX_BYTES` and `METADATA_TIMEOUT_MS`; at most
+`METADATA_MAX_FETCHES_PER_PASS` URLs are fetched per sync, each distinct URL once.
+`METADATA_FETCH=false` turns fetching off (inline metadata is still read).
+
+Check a document before publishing it:
+
+```bash
+pnpm billing metadata-check ./plan.json            # or an https URL, or inline JSON
+```
+
+It prints the normalized result, any ignored fields, and, for inline JSON, its size against the
+128-byte limit. For a file or URL it also prints a compact inline equivalent if one fits.
+
 ## Security notes
 
 - The worker key only needs to be the plan owner or one of its `pullers`. Prefer a dedicated
@@ -194,6 +257,9 @@ v0.1. Tested three ways:
 - read-only sync of real devnet data (~1k plans, ~900 subscriptions), including event ingestion:
   every decoded transfer matched its subscription, plan, mint, period limit and an authorized
   puller in the account snapshot;
+- plan metadata for all 494 mainnet plans, resolved in one pass (91 fetches, one per distinct
+  URL): inline, hosted, empty and tag-style URIs, plus HTML pages, 404s and dead hosts, each
+  classified as above;
 - end-to-end on Surfpool (mainnet fork, the deployed program, real USDC): the worker charges as a
   whitelisted puller, creates the merchant's token account, blocks an underfunded subscriber in
   preflight without sending, charges again only in the next period, stops after cancellation, and
@@ -207,7 +273,7 @@ v0.1. Tested three ways:
 - [x] `entitlement.changed` events, including time-based changes (`past_due`, access ending)
 - [x] Event ingestion (self-CPI events) for a full payment ledger, including pulls by other pullers
 - [x] Batching several charges per transaction
-- [ ] Plan metadata JSON schema for `metadataUri`
+- [x] Plan metadata JSON schema for `metadataUri`, resolved and served by the API
 
 ## Development
 
