@@ -304,8 +304,10 @@ surfpool start --ci --no-tui --no-deploy --network mainnet   # in another termin
 pnpm test:e2e
 ```
 
-Use Surfpool **1.6 or newer** (release binaries on GitHub). The Homebrew tap currently ships 1.0.0,
-which rejects the program's `createPlan` with "insufficient funds for rent".
+Use Surfpool **1.7.0 or newer** ([release binaries](https://github.com/txtx/surfpool/releases)).
+Older versions, including the 1.0.0 the Homebrew tap ships, still enforce the pre-reduction rent rate
+while the program funds accounts at mainnet's current one, so `createPlan` fails with "insufficient
+funds for rent".
 
 ## License
 
