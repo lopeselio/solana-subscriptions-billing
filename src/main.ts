@@ -17,6 +17,7 @@ import { resolvePlanMetadata } from './metadata/resolve.js';
 import { deliverDueEvents, type WebhookConfig } from './webhooks/dispatcher.js';
 import { generateSecret } from './webhooks/signature.js';
 import { runChargeCycle } from './worker/charge.js';
+import { LoopsModule } from './worker/loops.js';
 
 const USAGE = `usage: billing <command>
 
@@ -153,51 +154,30 @@ async function main() {
         return db.close();
     }
 
-    const app = await buildServer({ repo, apiKey: cfg.API_KEY, graceSecs: cfg.GRACE_PERIOD_SECS });
-    await app.listen({ host: cfg.API_HOST, port: cfg.API_PORT });
+    // The API (and, for `run`, the background loops) run as one NestJS app. Its shutdown hooks
+    // stop the loops after their current iteration, close the HTTP server, then the database.
+    const loops =
+        cmd === 'run'
+            ? LoopsModule.forRoot({
+                  sync,
+                  charge: signer ? charge : undefined,
+                  deliver: webhookCfg ? deliver : undefined,
+                  syncIntervalSecs: cfg.SYNC_INTERVAL_SECS,
+                  chargeIntervalSecs: cfg.CHARGE_INTERVAL_SECS,
+                  webhookIntervalSecs: cfg.WEBHOOK_INTERVAL_SECS,
+                  log,
+                  onShutdown: () => db.close(),
+              })
+            : null;
+    if (webhookCfg && loops) log.info({ url: webhookCfg.url }, 'webhook delivery enabled');
+    const server = await buildServer(
+        { repo, apiKey: cfg.API_KEY, graceSecs: cfg.GRACE_PERIOD_SECS },
+        { imports: loops ? [loops] : [] },
+    );
+    server.app.enableShutdownHooks();
+    if (!loops) process.once('beforeExit', () => void db.close());
+    await server.listen({ host: cfg.API_HOST, port: cfg.API_PORT });
     log.info({ host: cfg.API_HOST, port: cfg.API_PORT }, 'api listening');
-    if (cmd === 'api') return;
-
-    // Sync and charge share one loop so a charge cycle always sees a fresh snapshot.
-    let stopping = false;
-    let lastCharge = 0;
-    const loop = async () => {
-        while (!stopping) {
-            try {
-                await sync();
-                if (signer && Date.now() - lastCharge >= cfg.CHARGE_INTERVAL_SECS * 1000) {
-                    lastCharge = Date.now();
-                    await charge();
-                }
-            } catch (err) {
-                log.error({ err }, 'loop iteration failed');
-            }
-            await new Promise(r => setTimeout(r, cfg.SYNC_INTERVAL_SECS * 1000));
-        }
-    };
-    // Webhooks get their own, shorter loop so delivery latency doesn't depend on sync time.
-    const deliveryLoop = async () => {
-        while (!stopping && webhookCfg) {
-            try {
-                await deliver();
-            } catch (err) {
-                log.error({ err }, 'webhook delivery pass failed');
-            }
-            await new Promise(r => setTimeout(r, cfg.WEBHOOK_INTERVAL_SECS * 1000));
-        }
-    };
-    if (webhookCfg) log.info({ url: webhookCfg.url }, 'webhook delivery enabled');
-    const done = Promise.all([loop(), deliveryLoop()]);
-    const shutdown = async () => {
-        stopping = true;
-        log.info('shutting down');
-        await app.close();
-        await done;
-        await db.close();
-        process.exit(0);
-    };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
 }
 
 main().catch(err => {
