@@ -153,7 +153,7 @@ async function main() {
         return db.close();
     }
 
-    const app = buildServer({ repo, apiKey: cfg.API_KEY, graceSecs: cfg.GRACE_PERIOD_SECS });
+    const app = await buildServer({ repo, apiKey: cfg.API_KEY, graceSecs: cfg.GRACE_PERIOD_SECS });
     await app.listen({ host: cfg.API_HOST, port: cfg.API_PORT });
     log.info({ host: cfg.API_HOST, port: cfg.API_PORT }, 'api listening');
     if (cmd === 'api') return;

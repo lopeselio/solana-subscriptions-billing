@@ -149,7 +149,7 @@ describe('charging', () => {
 describe('api', () => {
     it('reports entitlement through the payment lifecycle', async () => {
         const graceSecs = 3600n;
-        const app = buildServer({ repo, graceSecs, now: () => chain.now, apiKey: 'test-key-0123456789' });
+        const app = await buildServer({ repo, graceSecs, now: () => chain.now, apiKey: 'test-key-0123456789' });
         const get = (url: string) =>
             app.inject({ method: 'GET', url, headers: { authorization: 'Bearer test-key-0123456789' } });
 

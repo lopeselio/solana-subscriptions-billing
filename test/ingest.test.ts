@@ -132,7 +132,7 @@ describe('live ingestion', () => {
         await sync();
         chain.externalPull(SUB, 500n, MERCHANT);
         await ingest();
-        const app = buildServer({ repo, graceSecs: 0n });
+        const app = await buildServer({ repo, graceSecs: 0n });
         const all = (await app.inject({ url: `/payments?subscription=${SUB}` })).json() as { data: { puller: string } }[];
         expect(all.map(p => p.data.puller)).toEqual([MERCHANT, PULLER]); // newest first
         const sub = (await app.inject({ url: `/subscriptions/${SUB}` })).json() as { payments: unknown[] };

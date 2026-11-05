@@ -1,155 +1,65 @@
-import { timingSafeEqual } from 'node:crypto';
+import 'reflect-metadata';
 
-import Fastify, { type FastifyInstance } from 'fastify';
-import { z } from 'zod';
+import { type DynamicModule, Module } from '@nestjs/common';
+import { APP_FILTER, APP_GUARD, NestFactory } from '@nestjs/core';
+import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fastify';
+import type { FastifyInstance } from 'fastify';
 
-import { computeChargeState, computeEntitlement } from '../core/billing.js';
-import type { ChargeAttempt, PlanRecord, Repo, SubscriptionRecord } from '../db/repo.js';
+import { CONTROLLERS } from './controllers.js';
+import { ApiExceptionFilter, ApiKeyGuard } from './http.js';
+import { API_OPTIONS, type ApiOptions, type ApiSettings, REPO } from './tokens.js';
 
-export interface ApiOptions {
-    repo: Repo;
-    /** Optional bearer token. When unset the API is open — bind it to localhost. */
-    apiKey?: string;
-    graceSecs: bigint;
-    /** Clock in unix seconds; injectable for tests. */
-    now?: () => bigint;
-}
+export type { ApiOptions } from './tokens.js';
 
-const wallet = z.string().min(32).max(44);
-
-/** JSON-safe view: bigint -> string, Date -> ISO. */
-function json<T>(v: T): unknown {
-    return JSON.parse(
-        JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x)),
-    );
-}
-
-function snapshot(s: SubscriptionRecord) {
-    return {
-        amountPerPeriod: s.amount,
-        periodHours: s.periodHours,
-        currentPeriodStartTs: s.currentPeriodStartTs,
-        amountPulledInPeriod: s.amountPulledInPeriod,
-        expiresAtTs: s.expiresAtTs,
-    };
-}
-
-function view(s: SubscriptionRecord, plan: PlanRecord | null, now: bigint, graceSecs: bigint) {
-    const planSnap = { endTs: plan?.endTs ?? 0n };
-    return {
-        ...s,
-        billing: computeChargeState(snapshot(s), planSnap, now),
-        entitlement: s.closed
-            ? { status: 'closed', entitled: false, accessUntilTs: null }
-            : computeEntitlement(snapshot(s), planSnap, now, graceSecs),
-    };
-}
-
-function attemptView(a: ChargeAttempt) {
-    return { ...a };
-}
-
-export function buildServer(opts: ApiOptions): FastifyInstance {
-    const app = Fastify({ logger: false });
-    const now = opts.now ?? (() => BigInt(Math.floor(Date.now() / 1000)));
-    const { repo, graceSecs } = opts;
-
-    if (opts.apiKey) {
-        const expected = Buffer.from(`Bearer ${opts.apiKey}`);
-        app.addHook('onRequest', async (req, reply) => {
-            if (req.url === '/health') return;
-            const got = Buffer.from(req.headers.authorization ?? '');
-            if (got.length !== expected.length || !timingSafeEqual(got, expected)) {
-                return reply.code(401).send({ error: 'unauthorized' });
-            }
-        });
+/** The HTTP API: controllers, the bearer-token guard and the error filter. */
+@Module({})
+export class ApiModule {
+    static forRoot(opts: ApiOptions): DynamicModule {
+        const settings: ApiSettings = {
+            apiKey: opts.apiKey,
+            graceSecs: opts.graceSecs,
+            now: opts.now ?? (() => BigInt(Math.floor(Date.now() / 1000))),
+        };
+        return {
+            module: ApiModule,
+            controllers: CONTROLLERS,
+            providers: [
+                { provide: REPO, useValue: opts.repo },
+                { provide: API_OPTIONS, useValue: settings },
+                { provide: APP_GUARD, useClass: ApiKeyGuard },
+                { provide: APP_FILTER, useClass: ApiExceptionFilter },
+            ],
+        };
     }
+}
 
-    app.get('/health', async () => ({ ok: true }));
+@Module({})
+class AppModule {}
 
-    app.get('/plans', async () => json(await repo.listPlans()));
+export interface Server {
+    app: NestFastifyApplication;
+    /** Fastify's light-my-request injection, for tests. */
+    inject: FastifyInstance['inject'];
+    listen(opts: { host: string; port: number }): Promise<void>;
+    close(): Promise<void>;
+}
 
-    app.get('/plans/:address', async (req, reply) => {
-        const { address } = z.object({ address: wallet }).parse(req.params);
-        const plan = await repo.getPlan(address);
-        if (!plan) return reply.code(404).send({ error: 'not_found' });
-        const subs = await repo.listSubscriptions({ plan: address });
-        const t = now();
-        return json({ ...plan, subscriptions: subs.map(s => view(s, plan, t, graceSecs)) });
-    });
-
-    app.get('/subscriptions/:address', async (req, reply) => {
-        const { address } = z.object({ address: wallet }).parse(req.params);
-        const sub = await repo.getSubscription(address);
-        if (!sub) return reply.code(404).send({ error: 'not_found' });
-        const plan = await repo.getPlan(sub.plan);
-        const attempts = await repo.listAttempts({ subscription: address, limit: 50 });
-        const payments = await repo.listChainEvents({ kind: 'subscription_transfer', subscription: address, limit: 50 });
-        return json({ ...view(sub, plan, now(), graceSecs), attempts: attempts.map(attemptView), payments });
-    });
-
-    /** Is this wallet allowed access right now? Optionally scoped to one plan. */
-    app.get('/entitlements/:wallet', async req => {
-        const params = z.object({ wallet }).parse(req.params);
-        const query = z.object({ plan: wallet.optional() }).parse(req.query);
-        const subs = await repo.listSubscriptions({ subscriber: params.wallet, plan: query.plan });
-        const t = now();
-        const items = await Promise.all(
-            subs.map(async s => {
-                const plan = await repo.getPlan(s.plan);
-                return { subscription: s.address, plan: s.plan, ...computeEntitlement(snapshot(s), { endTs: plan?.endTs ?? 0n }, t, graceSecs) };
-            }),
-        );
-        return json({ wallet: params.wallet, entitled: items.some(i => i.entitled), subscriptions: items });
-    });
-
-    app.get('/charges', async req => {
-        const q = z
-            .object({
-                status: z.enum(['pending', 'succeeded', 'failed']).optional(),
-                subscription: wallet.optional(),
-                limit: z.coerce.number().int().min(1).max(1000).optional(),
-            })
-            .parse(req.query);
-        return json((await repo.listAttempts(q)).map(attemptView));
-    });
-
-    /** On-chain payment ledger (every subscription transfer, by any puller), newest first. */
-    app.get('/payments', async req => {
-        const q = z
-            .object({
-                plan: wallet.optional(),
-                subscription: wallet.optional(),
-                subscriber: wallet.optional(),
-                limit: z.coerce.number().int().min(1).max(1000).optional(),
-            })
-            .parse(req.query);
-        return json(await repo.listChainEvents({ ...q, kind: 'subscription_transfer' }));
-    });
-
-    /** Event log, oldest first. Poll with `after` = the last id seen; same events as the webhooks. */
-    app.get('/events', async req => {
-        const q = z
-            .object({
-                after: z.coerce.bigint().min(0n).optional(),
-                type: z.string().max(64).optional(),
-                limit: z.coerce.number().int().min(1).max(1000).optional(),
-            })
-            .parse(req.query);
-        return json(await repo.listEvents(q));
-    });
-
-    /** Re-queue an event for webhook delivery (e.g. after fixing a receiver), with a fresh retry budget. */
-    app.post('/events/:eventId/redeliver', async (req, reply) => {
-        const { eventId } = z.object({ eventId: z.string().regex(/^evt_[0-9a-f]{32}$/) }).parse(req.params);
-        if (!(await repo.redeliverEvent(eventId))) return reply.code(404).send({ error: 'not_found' });
-        return reply.code(202).send({ eventId, deliveryStatus: 'pending' });
-    });
-
-    app.setErrorHandler((err, _req, reply) => {
-        if (err instanceof z.ZodError) return reply.code(400).send({ error: 'bad_request', issues: err.issues });
-        return reply.code(500).send({ error: 'internal' });
-    });
-
-    return app;
+/**
+ * Builds the API as a NestJS app on the Fastify adapter. Extra modules (for example the
+ * background billing loops) share the app's lifecycle, so they start on boot and stop
+ * cleanly on shutdown.
+ */
+export async function buildServer(opts: ApiOptions, extra: { imports?: DynamicModule[] } = {}): Promise<Server> {
+    const root: DynamicModule = { module: AppModule, imports: [ApiModule.forRoot(opts), ...(extra.imports ?? [])] };
+    const app = await NestFactory.create<NestFastifyApplication>(root, new FastifyAdapter(), { logger: false });
+    await app.init();
+    const fastify = app.getHttpAdapter().getInstance() as unknown as FastifyInstance;
+    return {
+        app,
+        inject: fastify.inject.bind(fastify) as FastifyInstance['inject'],
+        listen: async ({ host, port }) => {
+            await app.listen(port, host);
+        },
+        close: () => app.close(),
+    };
 }

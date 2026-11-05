@@ -209,7 +209,7 @@ describe('resolution pass', () => {
         expect(await meta()).toMatchObject({ status: 'ok', source: 'url', data: { name: 'Pro', features: ['A', 'B'] }, error: null });
         expect(await pass()).toEqual({ resolved: 0, fetched: 0 });
 
-        const app = buildServer({ repo, graceSecs: 0n });
+        const app = await buildServer({ repo, graceSecs: 0n });
         const body = (await app.inject({ url: `/plans/${PLAN}` })).json();
         expect(body.metadata).toMatchObject({ status: 'ok', data: { name: 'Pro' } });
         expect((await app.inject({ url: '/plans' })).json()[0].metadata.data.name).toBe('Pro');

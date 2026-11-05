@@ -263,7 +263,7 @@ describe('delivery', () => {
         const [e] = await repo.listEvents();
         expect((await event(e!.id)).deliveryStatus).toBe('failed');
 
-        const app = buildServer({ repo, graceSecs: 0n });
+        const app = await buildServer({ repo, graceSecs: 0n });
         const missing = await app.inject({ method: 'POST', url: '/events/evt_00000000000000000000000000000000/redeliver' });
         expect(missing.statusCode).toBe(404);
         const res = await app.inject({ method: 'POST', url: `/events/${e!.eventId}/redeliver` });
@@ -280,7 +280,7 @@ describe('GET /events', () => {
         await cycle();
         chain.now += 720n * HOUR;
         await cycle();
-        const app = buildServer({ repo, graceSecs: 0n });
+        const app = await buildServer({ repo, graceSecs: 0n });
 
         const first = (await app.inject({ url: '/events?limit=2' })).json() as { id: string; type: string }[];
         expect(first.map(e => e.type)).toEqual(['subscription.created', 'payment.succeeded']);
