@@ -33,3 +33,41 @@ jobs:
       # Unit + engine tests (embedded Postgres, fake chain). The Surfpool e2e suite skips itself
       # without SURFPOOL_URL.
       - run: pnpm test
+
+  e2e:
+    name: e2e (Surfpool mainnet fork)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SURFPOOL_VERSION: v1.7.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # 1.7.0+ applies mainnet's current rent rate; older builds reject createPlan.
+      - name: Install Surfpool
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/surfpool"
+          gh release download "$SURFPOOL_VERSION" -R txtx/surfpool -p 'surfpool-linux-x64.tar.gz' -D "$RUNNER_TEMP/surfpool"
+          tar xzf "$RUNNER_TEMP/surfpool/surfpool-linux-x64.tar.gz" -C "$RUNNER_TEMP/surfpool"
+          echo "$RUNNER_TEMP/surfpool" >> "$GITHUB_PATH"
+      - name: Start Surfpool
+        run: |
+          surfpool --version
+          nohup surfpool start --ci --no-tui --no-deploy --network mainnet > "$RUNNER_TEMP/surfpool.log" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf -X POST -H 'content-type: application/json' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' http://127.0.0.1:8899 && exit 0
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/surfpool.log"; exit 1
+      - run: pnpm test:e2e
+      - name: Surfpool log
+        if: failure()
+        run: tail -200 "$RUNNER_TEMP/surfpool.log"
