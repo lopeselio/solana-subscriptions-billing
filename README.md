@@ -277,6 +277,20 @@ v0.1. Tested three ways:
 
 ## Development
 
+The API and the background loops run as one [NestJS](https://nestjs.com) app on the Fastify adapter:
+
+| Piece | Where |
+| ----- | ----- |
+| Controllers for plans, subscriptions, entitlements, charges, payments and events | `src/api/controllers.ts` |
+| Bearer-token guard, zod validation pipe, error filter (stable `bad_request` / `not_found` bodies) | `src/api/http.ts` |
+| Sync + charge loop and webhook delivery loop, started on boot | `src/worker/loops.ts` |
+
+On SIGINT/SIGTERM the loops finish their current iteration (a charge is never cut off halfway),
+the HTTP server closes, and then the database. Billing rules, the idempotency guard, the ledger and
+webhook signing live outside Nest in `src/core`, `src/db`, `src/worker` and `src/webhooks`.
+Providers are injected by token (`src/api/tokens.ts`) because tsx and Vitest compile with esbuild,
+which doesn't emit the decorator metadata Nest would otherwise read.
+
 ```bash
 pnpm test        # unit + engine tests (embedded Postgres, fake chain); e2e is skipped
 pnpm typecheck
