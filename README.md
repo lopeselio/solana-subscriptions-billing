@@ -1,5 +1,7 @@
 # solana-subscriptions-billing
 
+[![CI](https://github.com/lopeselio/solana-subscriptions-billing/actions/workflows/ci.yml/badge.svg)](https://github.com/lopeselio/solana-subscriptions-billing/actions/workflows/ci.yml)
+
 Self-hostable billing engine for the [Solana Subscriptions program](https://github.com/solana-foundation/subscriptions)
 (`De1egAFMkMWZSN5rYXRj9CAdheBamobVNubTsi9avR44`).
 
